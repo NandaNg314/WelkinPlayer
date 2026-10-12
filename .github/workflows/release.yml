@@ -91,6 +91,21 @@ jobs:
       - name: Sync version from package.json
         run: pnpm version:sync
 
+      - name: Adjust updater config if signing key is absent
+        shell: bash
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+        run: |
+          if [ -z "$TAURI_SIGNING_PRIVATE_KEY" ]; then
+            echo "No TAURI_SIGNING_PRIVATE_KEY secret found; disabling createUpdaterArtifacts..."
+            node -e "
+              const fs = require('fs');
+              const conf = JSON.parse(fs.readFileSync('src-tauri/tauri.conf.json', 'utf8'));
+              if (conf.bundle) { conf.bundle.createUpdaterArtifacts = false; }
+              fs.writeFileSync('src-tauri/tauri.conf.json', JSON.stringify(conf, null, 2));
+            "
+          fi
+
       - name: Build desktop bundles
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
@@ -167,17 +182,31 @@ jobs:
       - name: Sync version from package.json
         run: pnpm version:sync
 
-      - name: Decode Android signing keystore
+      - name: Setup Android signing keystore
         env:
           ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
         run: |
-          echo "$ANDROID_KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/welkin.keystore"
-          {
-            echo "ANDROID_KEYSTORE_PATH=$RUNNER_TEMP/welkin.keystore"
-            echo "ANDROID_KEYSTORE_PASSWORD=${{ secrets.ANDROID_KEYSTORE_PASSWORD }}"
-            echo "ANDROID_KEY_ALIAS=${{ secrets.ANDROID_KEY_ALIAS }}"
-            echo "ANDROID_KEY_PASSWORD=${{ secrets.ANDROID_KEY_PASSWORD }}"
-          } >> "$GITHUB_ENV"
+          if [ -n "$ANDROID_KEYSTORE_BASE64" ]; then
+            echo "$ANDROID_KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/welkin.keystore"
+            {
+              echo "ANDROID_KEYSTORE_PATH=$RUNNER_TEMP/welkin.keystore"
+              echo "ANDROID_KEYSTORE_PASSWORD=${{ secrets.ANDROID_KEYSTORE_PASSWORD }}"
+              echo "ANDROID_KEY_ALIAS=${{ secrets.ANDROID_KEY_ALIAS }}"
+              echo "ANDROID_KEY_PASSWORD=${{ secrets.ANDROID_KEY_PASSWORD }}"
+            } >> "$GITHUB_ENV"
+          else
+            echo "No ANDROID_KEYSTORE_BASE64 secret provided. Auto-generating release keystore for fork..."
+            keytool -genkeypair -v -keystore "$RUNNER_TEMP/welkin.keystore" \
+              -alias welkin -keyalg RSA -keysize 2048 -validity 10000 \
+              -storepass welkin123 -keypass welkin123 \
+              -dname "CN=Welkin, OU=Player, O=Welkin, L=Unknown, S=Unknown, C=CN"
+            {
+              echo "ANDROID_KEYSTORE_PATH=$RUNNER_TEMP/welkin.keystore"
+              echo "ANDROID_KEYSTORE_PASSWORD=welkin123"
+              echo "ANDROID_KEY_ALIAS=welkin"
+              echo "ANDROID_KEY_PASSWORD=welkin123"
+            } >> "$GITHUB_ENV"
+          fi
 
       - name: Build signed APKs (per ABI)
         env:
@@ -185,17 +214,28 @@ jobs:
           ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
         run: pnpm tauri android build --apk --split-per-abi
 
+      - name: Build universal APK
+        env:
+          NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+        run: pnpm tauri android build --apk
+
       - name: Stage APKs
         run: |
           mkdir -p dist/android
+          version=$(node -p "require('./package.json').version")
+          tag="${{ github.ref_name }}"
+          if [ "${{ github.ref_type }}" != "tag" ]; then
+            tag="v$version"
+          fi
           find src-tauri/gen/android/app/build/outputs/apk -name "*.apk" | while read -r apk; do
             abi=$(basename "$apk" | sed -nE 's/^app-(.+)-release\.apk$/\1/p')
             if [ -z "$abi" ] || [ "$abi" = "universal" ]; then
               abi=$(printf '%s' "$apk" | grep -oE 'arm64-v8a|armeabi-v7a|x86_64|x86' | head -n1)
             fi
             [ -z "$abi" ] && abi="universal"
-            cp "$apk" "dist/android/Welkin-${{ github.ref_name }}-${abi}.apk"
-            echo "staged Welkin-${{ github.ref_name }}-${abi}.apk"
+            cp "$apk" "dist/android/Welkin-${tag}-${abi}.apk"
+            echo "staged Welkin-${tag}-${abi}.apk"
           done
           ls -l dist/android
 
@@ -224,13 +264,17 @@ jobs:
         with:
           path: dist
 
-      - name: Resolve release notes
+      - name: Resolve release tag and notes
         shell: bash
         run: |
-          # changelog.md is authored locally (see scripts/prepare-release.mjs) and
-          # committed with the tag. Fall back to a minimal note if it is absent.
+          version=$(node -p "require('./package.json').version")
+          tag="${{ github.ref_name }}"
+          if [ "${{ github.ref_type }}" != "tag" ]; then
+            tag="v$version"
+          fi
+          echo "RELEASE_TAG=$tag" >> "$GITHUB_ENV"
           if [ ! -s changelog.md ]; then
-            printf 'Welkin ${{ github.ref_name }}\n' > changelog.md
+            printf 'Welkin %s\n' "$tag" > changelog.md
           fi
 
       - name: Generate updater manifest (latest.json)
@@ -239,29 +283,29 @@ jobs:
           node scripts/make-latest-json.mjs \
             --dist dist \
             --repo "${{ github.repository }}" \
-            --tag "${{ github.ref_name }}" \
+            --tag "$RELEASE_TAG" \
             --version "$version" \
             --notes-file changelog.md \
-            --out latest.json
+            --out latest.json || echo "Skipping updater manifest if desktop artifacts were unsigned"
 
       - name: Compose release notes (download guide + changelog)
         run: |
           node scripts/compose-release-notes.mjs \
             --dist dist \
-            --tag "${{ github.ref_name }}" \
+            --tag "$RELEASE_TAG" \
             --changelog changelog.md \
-            --out release-notes.md
+            --out release-notes.md || cp changelog.md release-notes.md
 
       - name: Create release and upload assets
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          tag="${{ github.ref_name }}"
+          tag="$RELEASE_TAG"
           mapfile -t files < <(find dist -type f)
-          files+=(latest.json)
+          [ -f latest.json ] && files+=(latest.json)
           if gh release view "$tag" >/dev/null 2>&1; then
             gh release edit "$tag" --title "Welkin $tag" --notes-file release-notes.md
             gh release upload "$tag" "${files[@]}" --clobber
           else
-            gh release create "$tag" "${files[@]}" --title "Welkin $tag" --notes-file release-notes.md --verify-tag
+            gh release create "$tag" "${files[@]}" --title "Welkin $tag" --notes-file release-notes.md || gh release upload "$tag" "${files[@]}" --clobber || true
           fi

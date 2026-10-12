@@ -51,11 +51,11 @@ function onSeek(event: Event) {
 </script>
 
 <template>
-  <footer class="relative border-t border-line bg-surface">
+  <footer class="relative border-t border-line/70 bg-surface/90 backdrop-blur-xl">
     <input
       :value="player.progress"
       :style="{ '--fill': percent(player.progress), '--buffered': percent(player.bufferedProgress) }"
-      class="ak-slider absolute inset-x-0 top-0 z-10"
+      class="ak-slider absolute inset-x-0 -top-[2px] z-10"
       type="range"
       min="0"
       max="100"
@@ -63,10 +63,10 @@ function onSeek(event: Event) {
       @input="onSeek"
     />
     <div class="flex h-[72px] items-center gap-4 px-4">
-      <div class="grid min-w-0 flex-1 grid-cols-[44px_minmax(0,1fr)] items-center gap-x-3 gap-y-0.5 md:w-[220px] md:flex-none">
+      <div class="grid min-w-0 flex-1 grid-cols-[48px_minmax(0,1fr)] items-center gap-x-3.5 gap-y-0.5 md:w-[230px] md:flex-none">
         <button
           type="button"
-          class="row-span-2 grid h-11 w-11 place-items-center overflow-hidden text-lg font-black text-white/90"
+          class="row-span-2 grid h-12 w-12 place-items-center overflow-hidden rounded-2xl shadow-sm text-lg font-black text-white/90 transition-transform active:scale-95"
           :style="{ backgroundColor: player.currentTrack?.color }"
           @click="emit('open')"
         >
@@ -88,37 +88,37 @@ function onSeek(event: Event) {
         </div>
       </div>
 
-      <div class="absolute left-1/2 hidden -translate-x-1/2 items-center gap-2 md:flex">
-        <button class="grid h-9 w-9 place-items-center" :class="player.shuffle ? 'text-accent' : 'text-muted'" :title="shuffleTitle" @click="player.toggleShuffle()">
+      <div class="absolute left-1/2 hidden -translate-x-1/2 items-center gap-2.5 md:flex">
+        <button class="grid h-9 w-9 place-items-center rounded-full transition-colors hover:bg-fg/5" :class="player.shuffle ? 'text-accent' : 'text-muted'" :title="shuffleTitle" @click="player.toggleShuffle()">
           <Shuffle :size="16" :stroke-width="1.8" />
         </button>
-        <button class="grid h-10 w-10 place-items-center text-fg transition-colors hover:text-accent" @click="player.previous()">
-          <SkipBack :size="18" :stroke-width="2" />
+        <button class="grid h-10 w-10 place-items-center rounded-full text-fg transition-all hover:bg-fg/5 hover:text-accent active:scale-95" @click="player.previous()">
+          <SkipBack :size="19" :stroke-width="2" />
         </button>
         <button
-          class="ak-clip grid h-11 w-11 place-items-center bg-accent text-accent-fg transition-transform hover:scale-[1.03] active:scale-95"
+          class="grid h-12 w-12 place-items-center rounded-full bg-accent text-accent-fg shadow-md transition-transform hover:scale-105 active:scale-95"
           :aria-label="player.isPlaying ? t('controls.pause') : t('controls.play')"
           @click="player.togglePlayback()"
         >
-          <Pause v-if="player.isPlaying" :size="20" :stroke-width="2.2" />
-          <Play v-else :size="20" :stroke-width="2.2" />
+          <Pause v-if="player.isPlaying" :size="22" :stroke-width="2.2" />
+          <Play v-else :size="22" :stroke-width="2.2" class="translate-x-[1px]" />
         </button>
-        <button class="grid h-10 w-10 place-items-center text-fg transition-colors hover:text-accent" @click="player.next()">
-          <SkipForward :size="18" :stroke-width="2" />
+        <button class="grid h-10 w-10 place-items-center rounded-full text-fg transition-all hover:bg-fg/5 hover:text-accent active:scale-95" @click="player.next()">
+          <SkipForward :size="19" :stroke-width="2" />
         </button>
-        <button class="grid h-9 w-9 place-items-center" :class="player.repeat !== 'off' ? 'text-accent' : 'text-muted'" :title="repeatTitle" @click="player.cycleRepeat()">
+        <button class="grid h-9 w-9 place-items-center rounded-full transition-colors hover:bg-fg/5" :class="player.repeat !== 'off' ? 'text-accent' : 'text-muted'" :title="repeatTitle" @click="player.cycleRepeat()">
           <Repeat1 v-if="player.repeat === 'one'" :size="16" :stroke-width="1.8" />
           <Repeat v-else :size="16" :stroke-width="1.8" />
         </button>
       </div>
 
-      <div class="ml-auto flex items-center gap-2">
+      <div class="ml-auto flex items-center gap-2.5">
         <span class="hidden font-mono text-[13px] tabular-nums text-muted lg:block">
           {{ player.elapsedTime }} / {{ player.totalTime }}
         </span>
         <button
           type="button"
-          class="hidden transition-colors md:block"
+          class="hidden rounded-full p-2 transition-colors hover:bg-fg/5 md:block"
           :class="desktopLyrics.settings.enabled ? 'text-accent' : 'text-muted hover:text-fg'"
           :title="desktopLyricsTitle"
           :aria-label="desktopLyricsTitle"
@@ -126,27 +126,27 @@ function onSeek(event: Event) {
           :disabled="!desktopLyrics.supported"
           @click="toggleDesktopLyrics"
         >
-          <Captions v-if="desktopLyrics.settings.enabled" :size="17" :stroke-width="1.8" />
-          <CaptionsOff v-else :size="17" :stroke-width="1.8" />
+          <Captions v-if="desktopLyrics.settings.enabled" :size="18" :stroke-width="1.8" />
+          <CaptionsOff v-else :size="18" :stroke-width="1.8" />
         </button>
         <button
-          class="hidden text-muted transition-colors hover:text-fg sm:block"
+          class="hidden rounded-full p-2 text-muted transition-colors hover:bg-fg/5 hover:text-fg sm:block"
           :title="t('controls.queue')"
           :aria-label="t('controls.queue')"
           @click="emit('queue')"
         >
-          <ListMusic :size="17" :stroke-width="1.8" />
+          <ListMusic :size="18" :stroke-width="1.8" />
         </button>
         <div class="hidden items-center gap-2 md:flex">
           <button
             type="button"
-            class="text-dim transition-colors hover:text-fg"
+            class="rounded-full p-2 text-dim transition-colors hover:bg-fg/5 hover:text-fg"
             :title="player.muted ? t('controls.unmute') : t('controls.mute')"
             :aria-label="player.muted ? t('controls.unmute') : t('controls.mute')"
             @click="player.toggleMute()"
           >
-            <VolumeX v-if="player.muted" :size="17" :stroke-width="1.8" />
-            <Volume2 v-else :size="17" :stroke-width="1.8" />
+            <VolumeX v-if="player.muted" :size="18" :stroke-width="1.8" />
+            <Volume2 v-else :size="18" :stroke-width="1.8" />
           </button>
           <input
             v-model.number="player.volume"
@@ -159,16 +159,16 @@ function onSeek(event: Event) {
           />
         </div>
         <button
-          class="grid h-10 w-10 place-items-center bg-accent text-accent-fg transition-transform hover:scale-[1.03] active:scale-95 md:hidden"
+          class="grid h-11 w-11 place-items-center rounded-full bg-accent text-accent-fg shadow-md transition-transform hover:scale-105 active:scale-95 md:hidden"
           :aria-label="player.isPlaying ? t('controls.pause') : t('controls.play')"
           @click="player.togglePlayback()"
         >
-          <Pause v-if="player.isPlaying" :size="18" :stroke-width="2.2" />
-          <Play v-else :size="18" :stroke-width="2.2" />
+          <Pause v-if="player.isPlaying" :size="20" :stroke-width="2.2" />
+          <Play v-else :size="20" :stroke-width="2.2" class="translate-x-[1px]" />
         </button>
         <button
           type="button"
-          class="grid h-10 w-10 place-items-center text-muted transition-colors hover:text-fg md:hidden"
+          class="grid h-10 w-10 place-items-center rounded-full text-muted transition-colors hover:bg-fg/5 hover:text-fg md:hidden"
           :title="t(expanded ? 'controls.collapse' : 'controls.expand')"
           :aria-label="t(expanded ? 'controls.collapse' : 'controls.expand')"
           :aria-expanded="expanded"
@@ -182,26 +182,26 @@ function onSeek(event: Event) {
     <Transition name="tray">
       <div v-if="expanded" class="player-tray md:hidden">
       <div class="overflow-hidden">
-      <div class="grid gap-3 border-t border-line px-4 py-3">
+      <div class="grid gap-3 border-t border-line/70 px-4 py-3">
       <div class="flex items-center justify-between">
-        <button class="grid h-10 w-10 place-items-center" :class="player.shuffle ? 'text-accent' : 'text-muted'" :title="shuffleTitle" :aria-label="shuffleTitle" @click="player.toggleShuffle()">
+        <button class="grid h-10 w-10 place-items-center rounded-full hover:bg-fg/5" :class="player.shuffle ? 'text-accent' : 'text-muted'" :title="shuffleTitle" :aria-label="shuffleTitle" @click="player.toggleShuffle()">
           <Shuffle :size="17" :stroke-width="1.8" />
         </button>
-        <button class="grid h-10 w-10 place-items-center text-fg transition-colors hover:text-accent" :title="t('controls.previous')" :aria-label="t('controls.previous')" @click="player.previous()">
+        <button class="grid h-10 w-10 place-items-center rounded-full text-fg transition-all hover:bg-fg/5 hover:text-accent active:scale-95" :title="t('controls.previous')" :aria-label="t('controls.previous')" @click="player.previous()">
           <SkipBack :size="20" :stroke-width="2" />
         </button>
-        <button class="grid h-10 w-10 place-items-center text-fg transition-colors hover:text-accent" :title="t('controls.next')" :aria-label="t('controls.next')" @click="player.next()">
+        <button class="grid h-10 w-10 place-items-center rounded-full text-fg transition-all hover:bg-fg/5 hover:text-accent active:scale-95" :title="t('controls.next')" :aria-label="t('controls.next')" @click="player.next()">
           <SkipForward :size="20" :stroke-width="2" />
         </button>
-        <button class="grid h-10 w-10 place-items-center" :class="player.repeat !== 'off' ? 'text-accent' : 'text-muted'" :title="repeatTitle" :aria-label="repeatTitle" @click="player.cycleRepeat()">
+        <button class="grid h-10 w-10 place-items-center rounded-full hover:bg-fg/5" :class="player.repeat !== 'off' ? 'text-accent' : 'text-muted'" :title="repeatTitle" :aria-label="repeatTitle" @click="player.cycleRepeat()">
           <Repeat1 v-if="player.repeat === 'one'" :size="17" :stroke-width="1.8" />
           <Repeat v-else :size="17" :stroke-width="1.8" />
         </button>
-        <button class="grid h-10 w-10 place-items-center transition-colors" :class="desktopLyrics.settings.enabled ? 'text-accent' : 'text-muted hover:text-fg'" :title="desktopLyricsTitle" :aria-label="desktopLyricsTitle" :aria-pressed="desktopLyrics.settings.enabled" :disabled="!desktopLyrics.supported" @click="toggleDesktopLyrics">
+        <button class="grid h-10 w-10 place-items-center rounded-full transition-colors hover:bg-fg/5" :class="desktopLyrics.settings.enabled ? 'text-accent' : 'text-muted hover:text-fg'" :title="desktopLyricsTitle" :aria-label="desktopLyricsTitle" :aria-pressed="desktopLyrics.settings.enabled" :disabled="!desktopLyrics.supported" @click="toggleDesktopLyrics">
           <Captions v-if="desktopLyrics.settings.enabled" :size="18" :stroke-width="1.8" />
           <CaptionsOff v-else :size="18" :stroke-width="1.8" />
         </button>
-        <button class="grid h-10 w-10 place-items-center text-muted transition-colors hover:text-fg" :title="t('controls.queue')" :aria-label="t('controls.queue')" @click="emit('queue')">
+        <button class="grid h-10 w-10 place-items-center rounded-full text-muted transition-colors hover:bg-fg/5 hover:text-fg" :title="t('controls.queue')" :aria-label="t('controls.queue')" @click="emit('queue')">
           <ListMusic :size="18" :stroke-width="1.8" />
         </button>
       </div>

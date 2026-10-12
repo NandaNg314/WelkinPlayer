@@ -358,38 +358,45 @@ watch(
 
 <template>
   <div v-if="player.currentTrack" class="fixed inset-0 z-50 flex h-screen flex-col overflow-hidden bg-bg text-fg">
-    <div class="pointer-events-none absolute inset-0 opacity-20" :style="{ background: `radial-gradient(circle at 20% 20%, ${player.currentTrack.color}, transparent 55%), radial-gradient(circle at 80% 80%, ${player.currentTrack.color}, transparent 55%)` }"></div>
-    <div class="pointer-events-none absolute -right-32 top-1/2 h-[150%] w-40 rotate-[18deg] bg-accent/10"></div>
-    <div class="pointer-events-none absolute -left-24 bottom-0 h-[60%] w-24 -rotate-[18deg] bg-accent/5"></div>
+    <div class="pointer-events-none absolute inset-0 overflow-hidden">
+      <div
+        class="absolute -top-[20%] -left-[10%] h-[75vw] w-[75vw] rounded-full opacity-35 blur-[120px] transition-colors duration-1000"
+        :style="{ backgroundColor: player.currentTrack.color }"
+      ></div>
+      <div
+        class="absolute -bottom-[20%] -right-[10%] h-[75vw] w-[75vw] rounded-full opacity-30 blur-[130px] transition-colors duration-1000"
+        :style="{ backgroundColor: player.currentTrack.color }"
+      ></div>
+    </div>
     <header class="relative z-10 flex h-16 shrink-0 items-center px-5">
       <div class="ml-auto flex items-center gap-3">
         <button
           type="button"
-          class="grid h-10 w-10 place-items-center border border-line text-muted transition-all duration-300 ease-out hover:border-fg hover:text-fg"
+          class="grid h-10 w-10 place-items-center rounded-full bg-surface/60 text-muted backdrop-blur-md transition-all duration-300 ease-out hover:bg-surface hover:text-fg hover:shadow-md"
           :class="revealClass"
           :title="t('controls.return')"
           :aria-label="t('controls.return')"
           @click="emit('navigate', returnView)"
         >
-          <ChevronDown :size="16" :stroke-width="2" />
+          <ChevronDown :size="20" :stroke-width="2" />
         </button>
         <button
           type="button"
-          class="grid h-10 w-10 place-items-center border border-line text-muted transition-all duration-300 ease-out hover:border-fg hover:text-fg"
+          class="grid h-10 w-10 place-items-center rounded-full bg-surface/60 text-muted backdrop-blur-md transition-all duration-300 ease-out hover:bg-surface hover:text-fg hover:shadow-md"
           :class="revealClass"
           :title="fullscreenTitle"
           :aria-label="fullscreenTitle"
           :aria-pressed="isFullscreen"
           @click="toggleFullscreen()"
         >
-          <Minimize2 v-if="isFullscreen" :size="16" :stroke-width="2" />
-          <Maximize2 v-else :size="16" :stroke-width="2" />
+          <Minimize2 v-if="isFullscreen" :size="18" :stroke-width="2" />
+          <Maximize2 v-else :size="18" :stroke-width="2" />
         </button>
       </div>
     </header>
     <div class="relative z-10 grid min-h-0 flex-1 gap-6 overflow-hidden px-5 py-4 md:grid-cols-[minmax(220px,0.34fr)_minmax(0,0.66fr)] md:gap-12 md:px-10 md:py-8 lg:grid-cols-[minmax(280px,0.32fr)_minmax(0,0.68fr)] lg:gap-16 lg:px-16">
       <div class="hidden min-h-0 flex-col justify-center md:flex">
-        <div class="ak-frame mx-auto aspect-square w-full max-w-[420px] overflow-hidden" :style="{ backgroundColor: player.currentTrack.color }">
+        <div class="mx-auto aspect-square w-full max-w-[420px] overflow-hidden rounded-3xl shadow-2xl ring-1 ring-black/5" :style="{ backgroundColor: player.currentTrack.color }">
           <img v-if="player.currentTrack.cover" :src="player.currentTrack.cover" alt="" decoding="async" class="h-full w-full object-cover" />
           <span v-else-if="coverPending(player.currentTrack)" class="grid h-full w-full place-items-center text-white/90"><LoaderCircle :size="40" :stroke-width="1.8" class="animate-spin" /></span>
           <span v-else-if="player.currentTrack.metaLoaded" class="grid h-full w-full place-items-center text-8xl font-black text-white/90">{{ initial(player.currentTrack) }}</span>
@@ -401,11 +408,18 @@ watch(
         </div>
       </div>
       <div class="flex min-h-0 min-w-0 flex-col justify-center">
-        <div class="mb-5 md:hidden">
-          <h1 class="mt-2 truncate text-xl font-black leading-none tracking-tight">{{ player.currentTrack.title }}</h1>
-          <button v-if="player.currentTrack.album" type="button" class="mt-2 block w-fit max-w-full truncate text-left text-sm text-muted transition-colors hover:text-accent" :title="t('library.openAlbum')" @click="emit('openAlbum', player.currentTrack.album)">{{ player.currentTrack.album }}</button>
+        <div class="mb-5 flex items-center gap-3.5 md:hidden">
+          <div class="h-14 w-14 shrink-0 overflow-hidden rounded-2xl shadow-md" :style="{ backgroundColor: player.currentTrack.color }">
+            <img v-if="player.currentTrack.cover" :src="player.currentTrack.cover" alt="" decoding="async" class="h-full w-full object-cover" />
+            <span v-else-if="coverPending(player.currentTrack)" class="grid h-full w-full place-items-center text-white/90"><LoaderCircle :size="18" :stroke-width="1.8" class="animate-spin" /></span>
+            <span v-else-if="player.currentTrack.metaLoaded" class="grid h-full w-full place-items-center text-xl font-black text-white/90">{{ initial(player.currentTrack) }}</span>
+          </div>
+          <div class="min-w-0 flex-1">
+            <h1 class="truncate text-lg font-black leading-tight tracking-tight">{{ player.currentTrack.title }}</h1>
+            <p v-if="player.currentTrack.artist" class="mt-0.5 truncate text-xs text-muted">{{ player.currentTrack.artist }}</p>
+          </div>
         </div>
-        <div ref="lyricsScroll" class="lyrics-scroll min-h-0 flex-1 overflow-hidden border-l border-line pl-6 md:max-h-[76vh] md:pl-10" :style="{ '--active-index': lyrics.activeIndex, '--line-size': `${lyrics.classic.lineSize}px`, '--translation-size': `${lyrics.classic.translationSize}px`, '--line-spacing': `${lyrics.classic.lineSpacing}px`, '--line-weight': lyrics.classic.fontWeight, '--line-weight-active': lyricActiveWeight, fontFamily: lyricFontFamily }" @wheel.prevent="onWheel" @pointerdown="onTouchStart" @pointermove="onTouchMove" @pointerup="onTouchEnd" @pointercancel="onTouchEnd">
+        <div ref="lyricsScroll" class="lyrics-scroll min-h-0 flex-1 overflow-hidden border-l border-line/60 pl-6 md:max-h-[76vh] md:pl-10" :style="{ '--active-index': lyrics.activeIndex, '--line-size': `${lyrics.classic.lineSize}px`, '--translation-size': `${lyrics.classic.translationSize}px`, '--line-spacing': `${lyrics.classic.lineSpacing}px`, '--line-weight': lyrics.classic.fontWeight, '--line-weight-active': lyricActiveWeight, fontFamily: lyricFontFamily }" @wheel.prevent="onWheel" @pointerdown="onTouchStart" @pointermove="onTouchMove" @pointerup="onTouchEnd" @pointercancel="onTouchEnd">
           <div ref="lyricsTrack" class="lyrics-track" :class="{ 'is-manual': manualScroll }" :style="{ transform: `translate3d(0, ${-scrollOffset}px, 0)` }">
           <div class="pt-[30vh] pb-[50vh]">
             <p v-if="lyrics.status === 'loading'" class="text-muted">{{ t("lyrics.loading") }}</p>

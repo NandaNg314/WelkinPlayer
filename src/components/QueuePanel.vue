@@ -37,7 +37,7 @@ function playFromQueue(index: number) {
   <div class="flex h-full flex-col">
     <div class="flex items-center justify-between px-5 py-4">
       <h2 class="text-sm font-bold uppercase tracking-[0.25em]">{{ t("nowPlaying.queue") }}</h2>
-      <button class="text-dim transition-colors hover:text-fg" @click="emit('close')">
+      <button class="grid h-8 w-8 place-items-center rounded-full text-dim transition-colors hover:bg-fg/5 hover:text-fg" @click="emit('close')">
         <X :size="16" :stroke-width="1.8" />
       </button>
     </div>
@@ -46,7 +46,7 @@ function playFromQueue(index: number) {
       <p class="mb-2 font-mono text-[10px] uppercase tracking-[0.3em] text-dim">{{ t("nowPlaying.now") }}</p>
       <div class="flex items-center gap-3">
         <span
-          class="grid h-10 w-10 shrink-0 place-items-center overflow-hidden text-lg font-black text-white/90"
+          class="grid h-10 w-10 shrink-0 place-items-center overflow-hidden rounded-xl shadow-sm text-lg font-black text-white/90"
           :style="{ backgroundColor: player.currentTrack.color }"
         >
           <img v-if="player.currentTrack.cover" :src="player.currentTrack.cover" alt="" decoding="async" class="h-full w-full object-cover" />
@@ -67,17 +67,17 @@ function playFromQueue(index: number) {
     </div>
     <template v-else>
       <p class="shrink-0 px-5 pt-3 pb-2 font-mono text-[10px] uppercase tracking-[0.3em] text-dim">{{ t("nowPlaying.nextUp", { count: upcoming.length }) }}</p>
-      <VList :data="upcoming" :item-size="QUEUE_ROW_HEIGHT" class="min-h-0 flex-1">
+      <VList :data="upcoming" :item-size="QUEUE_ROW_HEIGHT" class="min-h-0 flex-1 px-2">
         <template #default="{ item: track, index }">
           <button
             type="button"
             v-request-meta="track"
-            class="flex w-full items-center gap-3 px-5 py-2 text-left transition-colors hover:bg-fg/5"
+            class="flex w-full items-center gap-3 px-3 py-2 text-left rounded-xl transition-colors hover:bg-fg/5"
             @click="playFromQueue(player.queueIndex + 1 + index)"
           >
             <span class="w-6 shrink-0 text-right font-mono text-[11px] tabular-nums text-dim">{{ pad(index + 1) }}</span>
             <span
-              class="grid h-9 w-9 shrink-0 place-items-center overflow-hidden text-sm font-black text-white/90"
+              class="grid h-9 w-9 shrink-0 place-items-center overflow-hidden rounded-xl shadow-sm text-sm font-black text-white/90"
               :style="{ backgroundColor: track.color }"
             >
               <img v-if="track.cover" :src="track.cover" alt="" loading="lazy" decoding="async" class="h-full w-full object-cover" />

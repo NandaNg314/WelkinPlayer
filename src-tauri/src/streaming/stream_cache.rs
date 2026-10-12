@@ -127,6 +127,31 @@ impl Entry {
             cv: Condvar::new(),
         }
     }
+
+    pub fn file_path(&self) -> PathBuf {
+        self.path.clone()
+    }
+
+    pub fn is_complete(&self) -> bool {
+        self.state.lock().unwrap().complete
+    }
+
+    pub fn wait_complete(&self, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        let mut state = self.state.lock().unwrap();
+        while !state.complete && state.failed.is_none() {
+            let now = Instant::now();
+            if now >= deadline {
+                return false;
+            }
+            let (next_state, timeout_result) = self.cv.wait_timeout(state, deadline - now).unwrap();
+            state = next_state;
+            if timeout_result.timed_out() {
+                break;
+            }
+        }
+        state.complete
+    }
 }
 
 /// Shared cache state, owned by the streaming proxy.

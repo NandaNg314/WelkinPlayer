@@ -253,24 +253,24 @@ function scrollToTop() {
               role="button"
               tabindex="0"
               :key="track.id"
-              class="grid w-full items-center gap-4 border-t border-line px-3 py-2 text-left"
+              class="grid w-full items-center gap-4 border-t border-line/40 px-3.5 py-2 text-left rounded-2xl transition-all"
               :title="track.unavailable ? t('library.unavailableHint') : undefined"
-              :class="[listGrid, track.unavailable ? 'cursor-not-allowed opacity-50' : (selectable ? (isSelected(track) ? 'cursor-pointer bg-accent/10' : 'cursor-pointer ak-hover') : (track.id === currentId ? 'cursor-pointer ak-select relative z-10 border-transparent' : 'cursor-pointer ak-hover'))]"
+              :class="[listGrid, track.unavailable ? 'cursor-not-allowed opacity-50' : (selectable ? (isSelected(track) ? 'cursor-pointer bg-accent/10' : 'cursor-pointer ak-hover') : (track.id === currentId ? 'cursor-pointer ak-select relative z-10 border-transparent shadow-sm' : 'cursor-pointer ak-hover'))]"
               @click="activate(track, $event)"
               @keydown.enter="activate(track)"
               @keydown.space.prevent="activate(track)"
               @contextmenu.prevent="openMenu($event, track)"
             >
-              <span v-if="selectable" class="grid h-5 w-5 place-items-center border-2" :class="isSelected(track) ? 'border-accent bg-accent text-accent-fg' : 'border-line-strong text-transparent'"><Check :size="12" :stroke-width="3" /></span>
+              <span v-if="selectable" class="grid h-5 w-5 place-items-center rounded-full border-2 transition-colors" :class="isSelected(track) ? 'border-accent bg-accent text-accent-fg' : 'border-line-strong text-transparent'"><Check :size="12" :stroke-width="3" /></span>
               <span v-else class="hidden font-mono text-[13px] tabular-nums text-dim md:block">{{ pad(index + 1) }}</span>
-              <span class="grid h-11 w-11 place-items-center overflow-hidden text-lg font-black text-white/90" :style="{ backgroundColor: track.color }"><CloudOff v-if="track.unavailable" :size="18" :stroke-width="2" /><img v-else-if="track.cover" :src="track.cover" alt="" loading="lazy" decoding="async" class="h-full w-full object-cover" /><LoaderCircle v-else-if="coverPending(track)" :size="18" :stroke-width="2" class="animate-spin" /><template v-else>{{ initial(track) }}</template></span>
+              <span class="grid h-11 w-11 place-items-center overflow-hidden rounded-2xl shadow-sm text-lg font-black text-white/90" :style="{ backgroundColor: track.color }"><CloudOff v-if="track.unavailable" :size="18" :stroke-width="2" /><img v-else-if="track.cover" :src="track.cover" alt="" loading="lazy" decoding="async" class="h-full w-full object-cover" /><LoaderCircle v-else-if="coverPending(track)" :size="18" :stroke-width="2" class="animate-spin" /><template v-else>{{ initial(track) }}</template></span>
               <span class="grid min-w-0 gap-0.5"><span class="flex min-w-0 items-center gap-1.5"><strong class="truncate text-sm font-semibold tracking-wide" :class="track.id === currentId ? 'text-accent' : 'text-fg'">{{ track.title }}</strong><CloudOff v-if="track.unavailable" :size="14" class="shrink-0 text-dim" :aria-label="t('library.unavailable')" /><CircleCheck v-else-if="isCached(track)" :size="14" class="shrink-0 text-accent" :aria-label="t('library.cached')" /></span><span class="flex min-w-0 items-center gap-1 md:hidden"><button v-if="track.artist && !track.unavailable" type="button" class="min-w-0 truncate text-left text-xs text-muted transition-colors hover:text-accent" :title="t('library.openArtist')" @click.stop="emit('openArtist', track.artist)">{{ track.artist }}</button><small v-else-if="track.artist" class="min-w-0 truncate text-xs text-muted">{{ track.artist }}</small><span v-if="track.artist && track.album && !track.unavailable" class="shrink-0 text-xs text-dim">·</span><button v-if="track.album && !track.unavailable" type="button" class="min-w-0 truncate text-left text-xs text-muted transition-colors hover:text-accent" :title="t('library.openAlbum')" @click.stop="emit('openAlbum', track.album)">{{ track.album }}</button><small v-else-if="track.album" class="min-w-0 truncate text-xs text-dim">{{ track.album }}</small></span><button v-if="track.artist && !track.unavailable" type="button" class="hidden min-w-0 truncate text-left text-xs text-muted transition-colors hover:text-accent md:block md:w-fit md:max-w-full" :title="t('library.openArtist')" @click.stop="emit('openArtist', track.artist)">{{ track.artist }}</button><small v-else-if="track.artist" class="hidden truncate text-xs text-muted md:block">{{ track.artist }}</small></span>
               <button v-if="track.album && !track.unavailable" type="button" class="hidden min-w-0 truncate text-left text-xs text-muted transition-colors hover:text-accent md:block md:w-fit md:max-w-full" :title="t('library.openAlbum')" @click.stop="emit('openAlbum', track.album)">{{ track.album }}</button>
               <span v-else-if="track.album" class="hidden truncate text-xs text-dim md:block">{{ track.album }}</span>
               <span v-else class="hidden truncate text-xs text-muted md:block"></span>
               <span class="hidden text-right font-mono text-[13px] tabular-nums text-muted md:block">{{ track.duration }}</span>
               <span class="grid place-items-center gap-0.5 text-dim"><span><CloudOff v-if="track.unavailable" :size="16" /><span v-else-if="track.id === currentId && playing" class="text-accent"><span class="ak-eq"><i></i><i></i><i></i></span></span><Pause v-else-if="track.id === currentId" :size="16" class="text-accent" /><Play v-else :size="16" /></span><span class="font-mono text-[11px] tabular-nums text-muted md:hidden">{{ track.duration }}</span></span>
-              <button v-if="showRemove" type="button" class="grid h-8 w-8 place-items-center text-dim transition-colors hover:text-red-500" :title="t('library.playlists.removeTrack')" @click.stop="emit('remove', track)"><Trash2 :size="15" /></button>
+              <button v-if="showRemove" type="button" class="grid h-8 w-8 place-items-center rounded-full text-dim transition-colors hover:bg-fg/5 hover:text-red-500" :title="t('library.playlists.removeTrack')" @click.stop="emit('remove', track)"><Trash2 :size="15" /></button>
             </div>
           </template>
         </component>
@@ -280,8 +280,8 @@ function scrollToTop() {
     </template>
     </div>
     <div v-if="controlsEnabled" class="pointer-events-none sticky bottom-4 z-30 mt-2 flex flex-col items-end gap-2 px-4">
-      <button v-if="showLocate" type="button" class="pointer-events-auto grid h-8 w-8 place-items-center border border-line bg-bg text-dim shadow-sm transition-colors hover:border-accent hover:text-accent" :title="t('library.locateCurrent')" @click="locateCurrent"><LocateFixed :size="14" :stroke-width="2" /></button>
-      <button v-if="showTop" type="button" class="pointer-events-auto grid h-8 w-8 place-items-center border border-line bg-bg text-dim shadow-sm transition-colors hover:border-accent hover:text-accent" :title="t('library.backToTop')" @click="scrollToTop"><ArrowUp :size="14" :stroke-width="2" /></button>
+      <button v-if="showLocate" type="button" class="pointer-events-auto grid h-9 w-9 place-items-center rounded-full border border-line/60 bg-surface/90 text-dim shadow-md backdrop-blur-md transition-all hover:scale-105 hover:border-accent hover:text-accent" :title="t('library.locateCurrent')" @click="locateCurrent"><LocateFixed :size="15" :stroke-width="2" /></button>
+      <button v-if="showTop" type="button" class="pointer-events-auto grid h-9 w-9 place-items-center rounded-full border border-line/60 bg-surface/90 text-dim shadow-md backdrop-blur-md transition-all hover:scale-105 hover:border-accent hover:text-accent" :title="t('library.backToTop')" @click="scrollToTop"><ArrowUp :size="15" :stroke-width="2" /></button>
     </div>
   </div>
 </template>

@@ -219,7 +219,8 @@ pub fn content_type_for(name: &str) -> Option<String> {
     let value = match extension.as_str() {
         "mp3" => "audio/mpeg",
         "flac" => "audio/flac",
-        "m4a" | "mp4" | "aac" => "audio/mp4",
+        "m4a" | "mp4" | "alac" => "audio/mp4",
+        "aac" => "audio/aac",
         "ogg" | "opus" => "audio/ogg",
         "wav" => "audio/wav",
         "wma" => "audio/x-ms-wma",

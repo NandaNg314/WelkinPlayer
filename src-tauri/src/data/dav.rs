@@ -24,7 +24,7 @@ use zeroize::Zeroizing;
 
 use crate::core::error::AppError;
 
-const AUDIO_EXTENSIONS: [&str; 8] = ["mp3", "flac", "m4a", "ogg", "wav", "aac", "opus", "wma"];
+const AUDIO_EXTENSIONS: [&str; 9] = ["mp3", "flac", "m4a", "ogg", "wav", "aac", "opus", "wma", "alac"];
 
 /// Maximum number of PROPFIND requests kept in flight while walking a library.
 const LIST_CONCURRENCY: usize = 8;
