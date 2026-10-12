@@ -20,6 +20,7 @@
 ## 功能特性
 
 - **音乐来源**：同时配置多个 WebDAV 与本地文件夹来源，可指定其中一个作为云端同步位置。
+- **音频格式**：MP3、FLAC、AAC、ALAC、OGG、Opus、WAV、WMA。AAC 等 WebView 原生支持的格式直接流式播放；ALAC 由内置的 WebAssembly 解码器实时解码，无需等待整首下载完成。
 - **歌词**：AMLL 逐字歌词渲染；在线歌词按顺序从 QQ 音乐、网易云音乐、AMLL 歌词库获取；本地同名字幕优先。
 - **桌面悬浮歌词**：独立的透明歌词窗口（Android 为系统悬浮窗）。
 - **系统媒体控制**：Windows SMTC、macOS Now Playing、Linux MPRIS、Android MediaSession。
@@ -37,12 +38,17 @@
 | 状态/i18n | Pinia、vue-i18n |
 | 样式 | Tailwind CSS 4 |
 | 歌词渲染 | [@applemusic-like-lyrics](https://github.com/amll-dev/applemusic-like-lyrics) |
+| ALAC 解码 | [symphonia](https://github.com/pdeljanov/Symphonia) 编译为 WebAssembly，经 WebAudio 输出 |
 | 更新 | tauri-plugin-updater（桌面） |
 
 ## 环境要求
 
 - Node.js 20+ 与 [pnpm](https://pnpm.io/) 9
 - Rust stable（rustup）
+- WASM 编译目标（ALAC 解码器需要，构建时自动编译）：
+  ```bash
+  rustup target add wasm32-unknown-unknown
+  ```
 - 平台依赖：
   - Windows：WebView2（Win11 自带）
   - macOS：Xcode Command Line Tools
@@ -79,8 +85,10 @@ pnpm tauri android build --apk # 构建 Android APK
 │  └─ lib/              # 通用工具与前端契约
 ├─ src-tauri/           # Rust 后端
 │  ├─ src/commands/     # Tauri 命令（媒体、WebDAV、更新等）
+│  ├─ alac-wasm/        # ALAC 解码器（编译为 WebAssembly）
 │  ├─ gen/android/      # Android 工程
 │  └─ tauri.conf.json   # 应用配置（版本、更新器等）
+├─ tests/               # ALAC 解码器集成测试（Node）
 ├─ scripts/             # 构建辅助脚本
 └─ .github/workflows/   # CI（发布流程）
 ```

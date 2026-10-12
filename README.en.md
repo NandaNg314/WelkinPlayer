@@ -20,6 +20,7 @@ A cross-platform music player built with [Tauri 2](https://v2.tauri.app/). It re
 ## Features
 
 - **Music sources**: Configure multiple WebDAV and local-folder sources at once; pick one as the cloud sync location.
+- **Audio formats**: MP3, FLAC, AAC, ALAC, OGG, Opus, WAV, WMA. Formats the WebView can decode natively (such as AAC) stream directly; ALAC is decoded in real time by a bundled WebAssembly decoder, so playback starts without waiting for the whole track to download.
 - **Lyrics**: AMLL word-by-word rendering; online lyrics fetched in order from QQ Music, NetEase Cloud Music and the AMLL lyrics library; same-named local lyrics win.
 - **Desktop lyrics overlay**: A separate transparent lyrics window (a system overlay on Android).
 - **System media controls**: Windows SMTC, macOS Now Playing, Linux MPRIS, Android MediaSession.
@@ -37,12 +38,17 @@ A cross-platform music player built with [Tauri 2](https://v2.tauri.app/). It re
 | State / i18n | Pinia, vue-i18n |
 | Styling | Tailwind CSS 4 |
 | Lyrics rendering | [@applemusic-like-lyrics](https://github.com/amll-dev/applemusic-like-lyrics) |
+| ALAC decoding | [Symphonia](https://github.com/pdeljanov/Symphonia) compiled to WebAssembly, output via WebAudio |
 | Updates | tauri-plugin-updater (desktop) |
 
 ## Requirements
 
 - Node.js 20+ and [pnpm](https://pnpm.io/) 9
 - Rust stable (rustup)
+- The WASM target (required by the ALAC decoder, compiled during the build):
+  ```bash
+  rustup target add wasm32-unknown-unknown
+  ```
 - Platform dependencies:
   - Windows: WebView2 (bundled with Windows 11)
   - macOS: Xcode Command Line Tools
@@ -79,8 +85,10 @@ pnpm tauri android build --apk # Android APK
 │  └─ lib/              # Shared utilities and frontend contracts
 ├─ src-tauri/           # Rust backend
 │  ├─ src/commands/     # Tauri commands (media, WebDAV, updates, ...)
+│  ├─ alac-wasm/        # ALAC decoder (compiled to WebAssembly)
 │  ├─ gen/android/      # Android project
 │  └─ tauri.conf.json   # App config (version, updater, ...)
+├─ tests/               # ALAC decoder integration tests (Node)
 ├─ scripts/             # Build helper scripts
 └─ .github/workflows/   # CI (release pipeline)
 ```
