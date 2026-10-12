@@ -166,7 +166,7 @@ fn handle(
 
     if source.is_local() {
         match local_root(&source) {
-            Ok(root) => serve_local(request, app, &source.id, &root, &remote_path, range.as_deref()),
+            Ok(root) => serve_local(request, &root, &remote_path, range.as_deref()),
             Err(error) => {
                 let _ = request.respond(text(400, &error));
             }
@@ -226,27 +226,8 @@ fn serve_stream(
     // The requested track is what is playing now: keep its read-ahead entry.
     cache.set_active(&key);
 
-    let ext = Path::new(remote_path)
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("")
-        .to_ascii_lowercase();
-    let is_m4a = ext == "m4a" || ext == "alac";
-    let wav_file = crate::streaming::alac::alac_wav_path(app, &key);
-
-    if is_m4a && wav_file.is_file() {
-        serve_cached_file(request, &wav_file, "stream.wav", range);
-        return;
-    }
-
     // A fully cached track is served straight from disk, no network at all.
     if let Some(file) = smart.complete_file(&key) {
-        if is_m4a && crate::streaming::alac::is_alac_file(&file) {
-            if let Ok(()) = crate::streaming::alac::transcode_alac_to_wav(&file, &wav_file) {
-                serve_cached_file(request, &wav_file, "stream.wav", range);
-                return;
-            }
-        }
         serve_cached_file(request, &file, remote_path, range);
         return;
     }
@@ -276,27 +257,6 @@ fn serve_stream(
             return;
         }
     };
-
-    // If it's an m4a/alac track, check if it's ALAC:
-    if is_m4a {
-        let stream_file = entry.file_path();
-        if entry.is_complete() {
-            if crate::streaming::alac::is_alac_file(&stream_file) {
-                if let Ok(()) = crate::streaming::alac::transcode_alac_to_wav(&stream_file, &wav_file) {
-                    serve_cached_file(request, &wav_file, "stream.wav", range);
-                    return;
-                }
-            }
-        } else if crate::streaming::alac::is_alac_file(&stream_file) {
-            // Confirmed ALAC: wait for stream download to finish, then transcode
-            if entry.wait_complete(std::time::Duration::from_secs(20)) {
-                if let Ok(()) = crate::streaming::alac::transcode_alac_to_wav(&stream_file, &wav_file) {
-                    serve_cached_file(request, &wav_file, "stream.wav", range);
-                    return;
-                }
-            }
-        }
-    }
 
     let (start, end, ranged) = match range.and_then(|value| parse_range(value, total)) {
         Some((start, end)) => (start, end, true),
@@ -423,14 +383,7 @@ fn local_root(source: &crate::data::sources::SourceConfig) -> Result<PathBuf, St
 }
 
 /// Serve a local file, honouring a single `Range` header.
-fn serve_local(
-    request: Request,
-    app: &AppHandle,
-    source_id: &str,
-    root: &Path,
-    remote_path: &str,
-    range: Option<&str>,
-) {
+fn serve_local(request: Request, root: &Path, remote_path: &str, range: Option<&str>) {
     let file_path = match safe_join(root, remote_path) {
         Ok(path) => path,
         Err(error) => {
@@ -438,26 +391,6 @@ fn serve_local(
             return;
         }
     };
-
-    let ext = Path::new(remote_path)
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("")
-        .to_ascii_lowercase();
-    if ext == "m4a" || ext == "alac" {
-        let key = asset_hash(source_id, remote_path);
-        let wav_file = crate::streaming::alac::alac_wav_path(app, &key);
-        if wav_file.is_file() {
-            serve_cached_file(request, &wav_file, "stream.wav", range);
-            return;
-        }
-        if crate::streaming::alac::is_alac_file(&file_path) {
-            if let Ok(()) = crate::streaming::alac::transcode_alac_to_wav(&file_path, &wav_file) {
-                serve_cached_file(request, &wav_file, "stream.wav", range);
-                return;
-            }
-        }
-    }
 
     let mut file = match std::fs::File::open(&file_path) {
         Ok(file) => file,

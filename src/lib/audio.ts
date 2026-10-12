@@ -14,6 +14,14 @@ import { pushToast } from "./toast";
 import { setStreamEndpoint, trackStreamUrl } from "./remote";
 import { trackKey } from "./sources";
 import type { StreamEndpoint } from "./remote";
+import { AlacEngine, wantsAlacEngine } from "./alacEngine";
+
+/**
+ * Playback surface used across this module. Native `<audio>` for formats the
+ * WebView decodes itself; the ALAC engine (wasm decoder + WebAudio) for m4a
+ * containers that may hold ALAC. Both expose the same media-element shape.
+ */
+type PlaybackElement = HTMLAudioElement | AlacEngine;
 
 /**
  * Single `<audio>` element driving playback. The store holds the state; this
@@ -24,7 +32,9 @@ import type { StreamEndpoint } from "./remote";
  * which injects WebDAV auth and pipes the upstream body, so the browser gets
  * native progressive playback and Range-based seeking.
  */
-let audio: HTMLAudioElement | null = null;
+let audio: PlaybackElement | null = null;
+/** Whether the active `audio` is the ALAC engine (vs a native element). */
+let usingAlacEngine = false;
 /** In-flight/complete initialisation, so repeated calls never build a second element. */
 let initPromise: Promise<void> | null = null;
 /** Collects the store watchers so they can be stopped on teardown. */
@@ -146,7 +156,7 @@ function t(key: string): string {
   return i18n.global.t(key);
 }
 
-function describeMediaError(element: HTMLAudioElement | null): string {
+function describeMediaError(element: PlaybackElement | null): string {
   switch (element?.error?.code) {
     case MediaError.MEDIA_ERR_SRC_NOT_SUPPORTED:
       return t("playback.unsupported");
@@ -263,10 +273,14 @@ function syncBuffered(force = false) {
 
 function setSource(path: string, sourceId?: string) {
   if (!audio) return;
-  const url = trackStreamUrl(path, sourceId);
-  if (!url) return;
 
   const player = usePlayerStore();
+  // The track type decides which engine plays it. Switch before setting src so
+  // the new element loads the stream directly.
+  switchEngineIfNeeded(player, path);
+
+  const url = trackStreamUrl(path, sourceId);
+  if (!url || !audio) return;
   // A new source must never inherit a seek that was queued for the previous track.
   pendingSeek = null;
   sourceGeneration += 1;
@@ -347,6 +361,93 @@ export function initAudio(): Promise<void> {
   return initPromise;
 }
 
+/** Create the audio engine matching the current track (ALAC-capable or native). */
+function createEngine(player: ReturnType<typeof usePlayerStore>): PlaybackElement {
+  const track = player.currentTrack;
+  const wantsAlac = track?.path ? wantsAlacEngine(track.path) : false;
+  usingAlacEngine = wantsAlac;
+  if (wantsAlac) {
+    const engine = new AlacEngine();
+    engine.volume = Math.min(1, Math.max(0, player.volume / 100));
+    engine.muted = player.muted;
+    return engine;
+  }
+  const element = new Audio();
+  element.preload = "metadata";
+  element.volume = Math.min(1, Math.max(0, player.volume / 100));
+  element.muted = player.muted;
+  return element;
+}
+
+/** Bind the store-syncing listeners to a playback element. */
+function bindAudioListeners(engine: PlaybackElement) {
+  const player = usePlayerStore();
+  engine.addEventListener("loadedmetadata", () => {
+    player.setDuration(engine.duration);
+    syncBuffered(true);
+    if (pendingSeek !== null) {
+      const limit = Number.isFinite(engine.duration) && engine.duration > 0 ? engine.duration : pendingSeek;
+      engine.currentTime = Math.min(pendingSeek, limit);
+      player.setPosition(engine.currentTime);
+      pendingSeek = null;
+    }
+  });
+  engine.addEventListener("durationchange", () => {
+    player.setDuration(engine.duration);
+    syncBuffered(true);
+  });
+  engine.addEventListener("timeupdate", () => {
+    player.setPosition(engine.currentTime);
+    syncBuffered();
+    lastProgressAt = performance.now();
+    reportStreamProgress(sourceGeneration);
+    maybePrefetchNext(sourceGeneration);
+  });
+  engine.addEventListener("progress", () => syncBuffered());
+  engine.addEventListener("play", () => {
+    lastProgressAt = performance.now();
+    if (!player.isPlaying) player.setPlaying(true);
+  });
+  engine.addEventListener("pause", () => {
+    if (player.isPlaying) player.setPlaying(false);
+  });
+  engine.addEventListener("ended", () => {
+    // A source that "ends" without ever reporting a duration is a broken/empty
+    // file. Auto-advancing would spin through the whole queue, so report it and
+    // stop instead.
+    if (!(engine.duration > 0)) {
+      fail(t("playback.failed"), sourceGeneration);
+      return;
+    }
+    player.next();
+  });
+  engine.addEventListener("error", () => {
+    // Ignore the error fired when the source is intentionally cleared.
+    const track = player.currentTrack;
+    if (!track?.path) return;
+    // A missing/undecodable source is indistinguishable from a failed fetch
+    // here, so probe for the real reason instead of blaming the format.
+    if (engine.error?.code === MediaError.MEDIA_ERR_SRC_NOT_SUPPORTED) {
+      void reportSourceUnavailable(sourceGeneration, track.path, track.sourceId);
+      return;
+    }
+    fail(describeMediaError(engine), sourceGeneration);
+  });
+}
+
+/** Swap the playback element when the track needs the ALAC engine. */
+function switchEngineIfNeeded(player: ReturnType<typeof usePlayerStore>, path: string) {
+  const wantsAlac = wantsAlacEngine(path);
+  if (usingAlacEngine === wantsAlac && audio) return;
+  if (audio) {
+    audio.removeAttribute("src");
+    audio.load();
+  }
+  // Recreate against the new track so the engine is configured correctly.
+  audio = createEngine(player);
+  bindAudioListeners(audio);
+}
+
 async function bootstrapAudio(): Promise<void> {
   const player = usePlayerStore();
 
@@ -357,54 +458,8 @@ async function bootstrapAudio(): Promise<void> {
     pushToast("error", t("playback.failed"));
   }
 
-  audio = new Audio();
-  audio.preload = "metadata";
-  audio.volume = Math.min(1, Math.max(0, player.volume / 100));
-  audio.muted = player.muted;
-
-  audio.addEventListener("loadedmetadata", () => {
-    player.setDuration(audio?.duration ?? 0);
-    syncBuffered(true);
-    if (pendingSeek !== null && audio) {
-      const limit = Number.isFinite(audio.duration) && audio.duration > 0 ? audio.duration : pendingSeek;
-      audio.currentTime = Math.min(pendingSeek, limit);
-      player.setPosition(audio.currentTime);
-      pendingSeek = null;
-    }
-  });
-  audio.addEventListener("durationchange", () => { player.setDuration(audio?.duration ?? 0); syncBuffered(true); });
-  audio.addEventListener("timeupdate", () => {
-    player.setPosition(audio?.currentTime ?? 0);
-    syncBuffered();
-    lastProgressAt = performance.now();
-    reportStreamProgress(sourceGeneration);
-    maybePrefetchNext(sourceGeneration);
-  });
-  audio.addEventListener("progress", () => syncBuffered());
-  audio.addEventListener("play", () => { lastProgressAt = performance.now(); if (!player.isPlaying) player.setPlaying(true); });
-  audio.addEventListener("pause", () => { if (player.isPlaying) player.setPlaying(false); });
-  audio.addEventListener("ended", () => {
-    // A source that "ends" without ever reporting a duration is a broken/empty
-    // file. Auto-advancing would spin through the whole queue, so report it and
-    // stop instead.
-    if (!audio || !(audio.duration > 0)) {
-      fail(t("playback.failed"), sourceGeneration);
-      return;
-    }
-    player.next();
-  });
-  audio.addEventListener("error", () => {
-    // Ignore the error fired when the source is intentionally cleared.
-    const track = player.currentTrack;
-    if (!track?.path) return;
-    // A missing/undecodable source is indistinguishable from a failed fetch
-    // here, so probe for the real reason instead of blaming the format.
-    if (audio?.error?.code === MediaError.MEDIA_ERR_SRC_NOT_SUPPORTED) {
-      void reportSourceUnavailable(sourceGeneration, track.path, track.sourceId);
-      return;
-    }
-    fail(describeMediaError(audio), sourceGeneration);
-  });
+  audio = createEngine(player);
+  bindAudioListeners(audio);
 
   scope = effectScope();
   scope.run(() => {

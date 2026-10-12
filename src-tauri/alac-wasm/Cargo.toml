@@ -1,0 +1,20 @@
+[package]
+name = "alac-wasm"
+version = "0.1.0"
+edition = "2021"
+description = "ALAC streaming decoder compiled to wasm32 for the webview playback path"
+license = "GPL-3.0-only"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+log = "0.4.34"
+symphonia = { version = "0.5", default-features = false, features = ["alac", "isomp4", "aac", "pcm"] }
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = "s"
+panic = "abort"
+strip = true

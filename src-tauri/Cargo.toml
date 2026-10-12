@@ -41,8 +41,6 @@ zeroize = "1"
 tiny_http = "0.12"
 # Audio metadata parsing reads only the file head (HTTP Range), never the whole file.
 lofty = "0.22"
-# Audio decoding for ALAC / M4A containers not natively supported by WebView
-symphonia = { version = "0.5", default-features = false, features = ["alac", "isomp4", "aac", "pcm"] }
 # Decode embedded cover art and re-encode a small JPEG thumbnail for the cache.
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "gif", "bmp", "tiff"] }
 base64 = "0.22"

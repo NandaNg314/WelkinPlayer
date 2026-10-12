@@ -6,7 +6,7 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "prebuild": "node scripts/sync-version.mjs",
+    "prebuild": "node scripts/sync-version.mjs && node scripts/build-alac-wasm.mjs",
     "build": "vue-tsc --noEmit && vite build",
     "preview": "vite preview",
     "version:sync": "node scripts/sync-version.mjs",
