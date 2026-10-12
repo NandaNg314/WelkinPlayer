@@ -59,7 +59,10 @@ pub fn run() {
                 Ok(status) if status.available => {}
                 Ok(status) => log::warn!(
                     "install identifier unavailable at startup: {}",
-                    status.warning.as_deref().unwrap_or("unknown keychain error")
+                    status
+                        .warning
+                        .as_deref()
+                        .unwrap_or("unknown keychain error")
                 ),
                 Err(error) => log::warn!("failed to prepare install identifier: {error}"),
             }

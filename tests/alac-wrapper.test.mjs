@@ -54,11 +54,11 @@ check("all allocations are 4-byte aligned", aligned,
   `first misaligned: ${JSON.stringify(firstMisaligned)}`);
 
 // ---- 3. a poll's output is visible through a freshly built view ----
-const session = exp.alac_open(BigInt(bytes.byteLength));
 // Feed a real fixture if one is available; otherwise just exercise the API.
 const fixture = process.argv[2];
 if (fixture) {
   const file = readFileSync(fixture);
+  const session = exp.alac_open(BigInt(file.length));
   const p = exp.alac_alloc(file.length);
   new Uint8Array(memory.buffer, p, file.length).set(file);
   exp.alac_feed(session, 0n, p, file.length);
@@ -77,10 +77,14 @@ if (fixture) {
     check("out pointer is 4-byte aligned", outPtr % 4 === 0, `ptr=${outPtr}`);
   }
   exp.alac_free(outPtr, cap * 4);
+  exp.alac_close(session);
 } else {
+  const session = exp.alac_open(BigInt(bytes.byteLength));
   console.log("  (no fixture arg — skipped decode check)");
+  exp.alac_close(session);
 }
-exp.alac_close(session);
 
 console.log(`\n${failures === 0 ? "PASS" : `FAIL (${failures})`}`);
-process.exit(failures === 0 ? 0 : 1);
+if (failures !== 0) {
+  process.exitCode = 1;
+}

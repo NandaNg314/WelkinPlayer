@@ -76,6 +76,10 @@ struct EntryState {
     total: Option<u64>,
     /// Playhead position in seconds, reported by the frontend.
     position: f64,
+    /// Furthest byte offset requested by the media element while the initial
+    /// playhead is still zero. Keeps concurrent metadata-probe ranges on the
+    /// same contiguous segment instead of invalidating earlier responses.
+    requested_offset: u64,
     /// Track duration in seconds, reported by the frontend.
     duration: f64,
     /// `(http status, message)` from a failed downloader, if any.
@@ -116,6 +120,7 @@ impl Entry {
                 seg_end: 0,
                 total: None,
                 position: 0.0,
+                requested_offset: 0,
                 duration: 0.0,
                 failed: None,
                 downloading: false,
@@ -155,7 +160,11 @@ impl StreamCache {
                 let _ = std::fs::remove_file(item.path());
             }
         }
-        let client = Client::builder().build().map_err(|error| error.to_string())?;
+        let client = Client::builder()
+            .connect_timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(10))
+            .build()
+            .map_err(|error| error.to_string())?;
         Ok(Self {
             dir,
             client,
@@ -235,6 +244,12 @@ impl StreamCache {
         let generation;
         {
             let mut state = entry.state.lock().unwrap();
+            let initial_load = state.seg_start == 0 && state.position <= 0.01;
+            if initial_load {
+                state.requested_offset = state.requested_offset.max(want_start);
+            } else if want_start > state.requested_offset {
+                state.requested_offset = want_start;
+            }
             // A real request clears the short preload override; a preload sets it.
             state.lead_override = lead;
             entry.cv.notify_all();
@@ -243,8 +258,8 @@ impl StreamCache {
             }
             // A downloader that stopped advancing is presumed hung; abandon it
             // (a new generation makes the stale thread bail) and fetch afresh.
-            let stalled = state.downloading
-                && state.last_advanced.elapsed() > Duration::from_secs(10);
+            let stalled =
+                state.downloading && state.last_advanced.elapsed() > Duration::from_secs(10);
             if stalled {
                 state.generation = state.generation.wrapping_add(1);
                 state.downloading = true;
@@ -259,7 +274,17 @@ impl StreamCache {
                 if covered && state.downloading {
                     return;
                 }
-                if covered {
+                // The WebView may request several byte ranges while probing
+                // startup metadata. Keep the initial download from byte zero
+                // alive so those readers do not invalidate one another.
+                if !covered && initial_load {
+                    if state.downloading {
+                        return;
+                    }
+                    state.downloading = true;
+                    state.failed = None;
+                    state.last_advanced = Instant::now();
+                } else if covered {
                     state.downloading = true;
                     state.failed = None;
                     state.last_advanced = Instant::now();
@@ -267,6 +292,7 @@ impl StreamCache {
                     let bytes_per_second = bytes_per_second(&state);
                     state.seg_start = want_start;
                     state.seg_end = want_start;
+                    state.requested_offset = want_start;
                     state.position = want_start as f64 / bytes_per_second;
                     state.generation = state.generation.wrapping_add(1);
                     state.complete = false;
@@ -314,7 +340,9 @@ impl StreamCache {
                 state.duration = duration;
             }
             if position.is_finite() && position >= 0.0 {
+                let position_bytes = (position * bytes_per_second(&state)) as u64;
                 state.position = position;
+                state.requested_offset = position_bytes;
             }
             entry.cv.notify_all();
         }
@@ -467,6 +495,13 @@ impl Read for CacheReader {
                     .min(available - self.offset)
                     .min(buf.len() as u64) as usize;
                 drop(state);
+                // `wait_total()` can wake the HTTP handler as soon as headers
+                // reveal the file size, before the downloader has created the
+                // cache file. Open lazily once bytes are visible so native
+                // media requests do not permanently retain a missing file.
+                if self.file.is_none() {
+                    self.file = Some(File::open(&self.entry.path)?);
+                }
                 let file = self.file.as_mut().ok_or_else(|| {
                     std::io::Error::new(std::io::ErrorKind::NotFound, "cache file missing")
                 })?;
@@ -508,16 +543,33 @@ pub(crate) fn open_upstream(
     enforce_url_policy(app, &url, source.allow_insecure)
         .map_err(|error| (403, error.to_string()))?;
     let password = source_password(app, &source.id).map_err(|error| (401, error.to_string()))?;
-    let url = crate::streaming::proxy::build_url(&url, remote_path).map_err(|error| (400, error))?;
+    let url =
+        crate::streaming::proxy::build_url(&url, remote_path).map_err(|error| (400, error))?;
 
     let response = client
         .get(url)
         .basic_auth(&username, Some(&password))
         .header(reqwest::header::RANGE, format!("bytes={start}-"))
         .send()
-        .map_err(|error| (502, error.to_string()))?;
+        .map_err(|error| {
+            log::error!(
+                "stream upstream request failed: timeout={} connect={} request={} body={}",
+                error.is_timeout(),
+                error.is_connect(),
+                error.is_request(),
+                error.is_body()
+            );
+            (502, error.to_string())
+        })?;
 
     let status = response.status();
+    log::info!(
+        "stream upstream response headers: status={} content_length={:?} content_type={:?} content_range={:?}",
+        status.as_u16(),
+        response.content_length(),
+        response.headers().get(reqwest::header::CONTENT_TYPE).and_then(|value| value.to_str().ok()),
+        response.headers().get(reqwest::header::CONTENT_RANGE).and_then(|value| value.to_str().ok())
+    );
     if !(status.is_success() || status == StatusCode::PARTIAL_CONTENT) {
         return Err((status.as_u16(), format!("上游返回 {status}")));
     }
@@ -535,7 +587,11 @@ pub(crate) fn response_total(response: &Response) -> Option<u64> {
             .to_str()
             .ok()?;
         let total = value.rsplit('/').next()?;
-        return if total == "*" { None } else { total.parse().ok() };
+        return if total == "*" {
+            None
+        } else {
+            total.parse().ok()
+        };
     }
     response.content_length()
 }
@@ -565,6 +621,7 @@ fn spawn_downloader(
         let mut state = entry.state.lock().unwrap();
         if state.generation == generation {
             if let Err((status, message)) = result {
+                log::error!("stream downloader stopped with error: status={status}");
                 state.failed = Some((status, message));
             }
             state.downloading = false;
@@ -595,8 +652,11 @@ fn run_downloader(
             let bytes_per_second = bytes_per_second(&state);
             let lead = (lead_seconds(&state) * bytes_per_second) as u64;
             let position = (state.position * bytes_per_second) as u64;
-            let desired = position.saturating_add(lead);
-            let target = state.total.map(|total| desired.min(total)).unwrap_or(desired);
+            let desired = position.max(state.requested_offset).saturating_add(lead);
+            let target = state
+                .total
+                .map(|total| desired.min(total))
+                .unwrap_or(desired);
             (state.seg_end, target, state.total, state.complete)
         };
 
@@ -611,11 +671,17 @@ fn run_downloader(
         }
         if cursor >= target {
             // Caught up to the lead window: sleep until the playhead advances.
-            let state = entry.state.lock().unwrap();
+            let mut state = entry.state.lock().unwrap();
             if state.generation != generation {
                 return Ok(());
             }
-            let _ = entry.cv.wait_timeout(state, Duration::from_secs(5)).unwrap();
+            // Reaching the read-ahead boundary is an intentional pause; refresh
+            // the watchdog while waiting for playback progress.
+            state.last_advanced = Instant::now();
+            let _ = entry
+                .cv
+                .wait_timeout(state, Duration::from_secs(5))
+                .unwrap();
             continue;
         }
 
@@ -652,13 +718,24 @@ fn run_downloader(
                 }
                 let bytes_per_second = bytes_per_second(&state);
                 let desired = ((state.position * bytes_per_second) as u64)
+                    .max(state.requested_offset)
                     .saturating_add((lead_seconds(&state) * bytes_per_second) as u64);
-                state.total.map(|total| desired.min(total)).unwrap_or(desired)
+                state
+                    .total
+                    .map(|total| desired.min(total))
+                    .unwrap_or(desired)
             };
             if cursor >= target {
                 break;
             }
-            let read = reader.read(&mut buffer).map_err(|error| (502, error.to_string()))?;
+            let read = reader.read(&mut buffer).map_err(|error| {
+                log::error!(
+                    "stream upstream body read failed: kind={:?} os_error={:?}",
+                    error.kind(),
+                    error.raw_os_error()
+                );
+                (502, error.to_string())
+            })?;
             if read == 0 {
                 let total = {
                     let state = entry.state.lock().unwrap();
@@ -729,7 +806,9 @@ pub fn read_smart_limit_mb(app: &AppHandle) -> u64 {
 
 /// Persist the smart cache budget (MiB).
 pub fn write_smart_limit_mb(app: &AppHandle, limit_mb: u64) -> Result<(), String> {
-    let store = app.store(SETTINGS_FILE).map_err(|error| error.to_string())?;
+    let store = app
+        .store(SETTINGS_FILE)
+        .map_err(|error| error.to_string())?;
     store.set(SMART_LIMIT_KEY, serde_json::json!(limit_mb));
     store.save().map_err(|error| error.to_string())?;
     Ok(())
@@ -764,7 +843,9 @@ fn read_bool(app: &AppHandle, key: &str, fallback: bool) -> bool {
 }
 
 fn write_bool(app: &AppHandle, key: &str, value: bool) -> Result<(), String> {
-    let store = app.store(SETTINGS_FILE).map_err(|error| error.to_string())?;
+    let store = app
+        .store(SETTINGS_FILE)
+        .map_err(|error| error.to_string())?;
     store.set(key, serde_json::json!(value));
     store.save().map_err(|error| error.to_string())?;
     Ok(())

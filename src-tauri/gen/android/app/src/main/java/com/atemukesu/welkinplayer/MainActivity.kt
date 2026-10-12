@@ -10,6 +10,7 @@ import android.app.Activity
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
+import android.webkit.WebView
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.core.content.ContextCompat
@@ -37,6 +38,7 @@ class MainActivity : TauriActivity() {
   override fun onCreate(savedInstanceState: Bundle?) {
     enableEdgeToEdge()
     super.onCreate(savedInstanceState)
+    WebView.setWebContentsDebuggingEnabled(BuildConfig.DEBUG)
     FolderPickerBridge.attach(this)
     FolderPickerBridge.registerFolderLauncher(folderLauncher)
     FolderPickerBridge.registerPermissionLauncher(permissionLauncher)

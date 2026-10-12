@@ -4,8 +4,8 @@
  * SPDX-License-Identifier: GPL-3.0-only
  */
 
-// Propagate package.json's version to the Tauri config and the Rust manifest so
-// the published update manifest always matches the version the UI reports.
+// Propagate package.json's version to the Tauri config, Android app metadata,
+// and the Rust manifest so release artifacts report one consistent version.
 // package.json is the single source of truth; this runs before every release
 // build (via the `prebuild` script) and can be invoked directly as well.
 
@@ -20,6 +20,12 @@ if (!/^\d+\.\d+\.\d+(?:[-+].+)?$/.test(version)) {
   console.error(`[version] package.json has an invalid version: ${version}`);
   process.exit(1);
 }
+
+const [major, minor, patchVersion] = version
+  .split(/[+-]/, 1)[0]
+  .split(".")
+  .map(Number);
+const androidVersionCode = major * 1_000_000 + minor * 1_000 + patchVersion;
 
 /** Rewrite a file in place, logging only when the content actually changed. */
 function patch(relativePath, transform) {
@@ -42,4 +48,10 @@ patch("src-tauri/Cargo.toml", (text) =>
 
 patch("src-tauri/Cargo.lock", (text) =>
   text.replace(/(name = "welkinplayer"\r?\nversion = ")[^"]*(")/, `$1${version}$2`)
+);
+
+patch("src-tauri/gen/android/app/tauri.properties", (text) =>
+  text
+    .replace(/^(tauri\.android\.versionName=).*$/m, `$1${version}`)
+    .replace(/^(tauri\.android\.versionCode=).*$/m, `$1${androidVersionCode}`)
 );

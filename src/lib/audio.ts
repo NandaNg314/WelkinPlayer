@@ -51,6 +51,8 @@ let sourceGeneration = 0;
 let reportedGeneration = -1;
 /** No `timeupdate` for this long while the store wants to play means a stall. */
 const STALL_TIMEOUT_MS = 4000;
+/** Some WebView/network failures stall before metadata without emitting error. */
+const LOAD_TIMEOUT_MS = 15_000;
 /** Minimum gap between automatic stall-recovery attempts. */
 const RECOVERY_COOLDOWN_MS = 3000;
 /** Report a network error after this many consecutive failed recoveries. */
@@ -204,10 +206,19 @@ function fail(message: string, generation: number, skip = false) {
 
 function play() {
   if (!audio) return;
+  const engine = audio;
   const generation = sourceGeneration;
   const track = usePlayerStore().currentTrack;
-  audio.play().catch((error: DOMException) => {
+  void engine.play().then(() => {
+    if (generation === sourceGeneration) {
+      console.info("[audio] play() resolved", {
+        engine: engine instanceof AlacEngine ? "alac" : "native",
+        readyState: engine.readyState,
+      });
+    }
+  }).catch((error: DOMException) => {
     if (isBenignPlayRejection(error)) return;
+    console.warn("[audio] play() rejected", error?.name ?? "unknown");
     if (error?.name === "NotSupportedError" && track?.path) {
       void reportSourceUnavailable(generation, track.path, track.sourceId);
       return;
@@ -290,6 +301,9 @@ function setSource(path: string, sourceId?: string) {
   prefetchedNextGeneration = -1;
   lastProgressReportAt = 0;
   lastBufferedAt = 0;
+  console.info(
+    `[audio] setSource engine=${audio instanceof AlacEngine ? "alac" : "native"} wantsPlayback=${player.isPlaying}`,
+  );
   audio.src = url;
   audio.load();
   player.setPosition(0);
@@ -309,6 +323,7 @@ function setSource(path: string, sourceId?: string) {
  */
 function recoverFromStall() {
   if (!audio) return;
+  console.warn("[audio] recoverFromStall! currentTime=", audio.currentTime, "readyState=", audio.readyState, "stallRecoveries=", stallRecoveries);
   const now = performance.now();
   if (now - lastRecoveryAt < RECOVERY_COOLDOWN_MS) return;
   lastRecoveryAt = now;
@@ -332,17 +347,35 @@ function recoverFromStall() {
 function checkStall() {
   if (!audio) return;
   const player = usePlayerStore();
-  if (!player.isPlaying || audio.paused || audio.ended || audio.seeking) return;
-  // A load that never produced metadata is handled by the error path instead.
-  if (audio.readyState < HTMLMediaElement.HAVE_METADATA) return;
-
+  if (!player.isPlaying || audio.ended || audio.seeking) return;
   const now = performance.now();
-  if (audio.readyState >= HTMLMediaElement.HAVE_FUTURE_DATA) {
-    // Enough data is buffered to keep playing: playback is healthy again.
-    lastProgressAt = now;
-    stallRecoveries = 0;
+  if (audio.paused) {
+    // Native audio remains paused while play() is pending. If it never starts
+    // and no event arrives, retry the source instead of waiting indefinitely.
+    if (now - lastProgressAt >= LOAD_TIMEOUT_MS) {
+      console.warn(
+        `[audio] playback start timed out readyState=${audio.readyState} engine=${audio instanceof AlacEngine ? "alac" : "native"}`,
+      );
+      recoverFromStall();
+    }
     return;
   }
+  // ALAC reads from the loopback proxy itself. Let its bounded Range request
+  // finish or time out before reloading the whole decoder at the same playhead.
+  if (audio instanceof AlacEngine && audio.waitingForData) return;
+  if (audio.readyState < HTMLMediaElement.HAVE_METADATA) {
+    if (now - lastProgressAt >= LOAD_TIMEOUT_MS) {
+      console.warn(
+        `[audio] metadata load timed out readyState=${audio.readyState} engine=${audio instanceof AlacEngine ? "alac" : "native"}`,
+      );
+      recoverFromStall();
+    }
+    return;
+  }
+  // Buffering does not mean the playhead is advancing. In particular, the
+  // ALAC engine can have PCM queued while its AudioContext is suspended, so
+  // resetting this timer from readyState hides a real playback stall. The
+  // `timeupdate` listener above refreshes it only when currentTime moves.
   if (now - lastProgressAt < STALL_TIMEOUT_MS) return;
   recoverFromStall();
 }
@@ -382,6 +415,14 @@ function createEngine(player: ReturnType<typeof usePlayerStore>): PlaybackElemen
 /** Bind the store-syncing listeners to a playback element. */
 function bindAudioListeners(engine: PlaybackElement) {
   const player = usePlayerStore();
+  for (const type of ["loadstart", "loadedmetadata", "canplay", "playing", "waiting", "stalled", "emptied"]) {
+    engine.addEventListener(type, () => {
+      const native = engine instanceof AlacEngine ? "" : ` networkState=${engine.networkState}`;
+      console.info(
+        `[audio] media event ${type} engine=${engine instanceof AlacEngine ? "alac" : "native"} readyState=${engine.readyState}${native} paused=${engine.paused} duration=${engine.duration}`,
+      );
+    });
+  }
   engine.addEventListener("loadedmetadata", () => {
     player.setDuration(engine.duration);
     syncBuffered(true);
@@ -400,6 +441,7 @@ function bindAudioListeners(engine: PlaybackElement) {
     player.setPosition(engine.currentTime);
     syncBuffered();
     lastProgressAt = performance.now();
+    stallRecoveries = 0;
     reportStreamProgress(sourceGeneration);
     maybePrefetchNext(sourceGeneration);
   });
@@ -412,6 +454,7 @@ function bindAudioListeners(engine: PlaybackElement) {
     if (player.isPlaying) player.setPlaying(false);
   });
   engine.addEventListener("ended", () => {
+    console.log("[audio] 'ended' event fired! currentTime=", engine.currentTime, "duration=", engine.duration, "usingAlac=", usingAlacEngine);
     // A source that "ends" without ever reporting a duration is a broken/empty
     // file. Auto-advancing would spin through the whole queue, so report it and
     // stop instead.
@@ -422,6 +465,7 @@ function bindAudioListeners(engine: PlaybackElement) {
     player.next();
   });
   engine.addEventListener("error", () => {
+    console.warn("[audio] 'error' event fired! code=", engine.error?.code);
     // Ignore the error fired when the source is intentionally cleared.
     const track = player.currentTrack;
     if (!track?.path) return;
@@ -438,6 +482,7 @@ function bindAudioListeners(engine: PlaybackElement) {
 /** Swap the playback element when the track needs the ALAC engine. */
 function switchEngineIfNeeded(player: ReturnType<typeof usePlayerStore>, path: string) {
   const wantsAlac = wantsAlacEngine(path);
+  console.info(`[audio] switchEngineIfNeeded wantsAlac=${wantsAlac} usingAlacEngine=${usingAlacEngine}`);
   if (usingAlacEngine === wantsAlac && audio) return;
   if (audio) {
     audio.removeAttribute("src");

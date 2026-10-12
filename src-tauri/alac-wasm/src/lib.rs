@@ -81,6 +81,15 @@ impl BytePool {
             .is_some_and(|end| end == self.total)
     }
 
+    /// Drop packet bytes that lie wholly before the next sample. Keep a range
+    /// that overlaps the boundary intact: Range fetches are already bounded,
+    /// and retaining the remaining suffix avoids copying a large chunk once
+    /// per decoded packet.
+    fn discard_before(&mut self, offset: u64) {
+        self.chunks
+            .retain(|(start, data)| start.saturating_add(data.len() as u64) > offset);
+    }
+
     /// Copy `len` bytes at `offset`; `Ok(())` only when the full range is
     /// present, else `Err(WouldBlock)`.
     fn read_exact(&self, offset: u64, buf: &mut [u8]) -> std::io::Result<()> {
@@ -128,7 +137,12 @@ impl Read for PoolSource {
         let (n, done) = {
             let pool = match self.pool.lock() {
                 Ok(p) => p,
-                Err(_) => return Err(std::io::Error::new(std::io::ErrorKind::Other, "pool poisoned")),
+                Err(_) => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        "pool poisoned",
+                    ))
+                }
             };
             let end = self.pos.saturating_add(buf.len() as u64);
             if end > pool.total {
@@ -200,8 +214,7 @@ enum SessionState {
         samples: Vec<Sample>,
         next_sample: usize,
     },
-    Ended,
-    Failed(String),
+    Failed,
 }
 
 pub struct Session {
@@ -328,7 +341,10 @@ impl Session {
         let mut left = quota;
         let mut cursor = *chunks.first()?;
         for (i, &size) in sizes.iter().enumerate() {
-            samples.push(Sample { offset: cursor, size });
+            samples.push(Sample {
+                offset: cursor,
+                size,
+            });
             cursor += u64::from(size);
             left -= 1;
             // Only advance to the next chunk when there are more samples left;
@@ -370,13 +386,13 @@ impl Session {
                     // fetches that region and retries.
                     return ProbeResult::NeedMoreBytes;
                 }
-                return ProbeResult::Failed("not a recognised audio container".into());
+                return ProbeResult::Failed;
             }
         };
         let format = probed.format;
         let Some(track) = format.default_track().cloned() else {
             self.last_error = "no audio track".into();
-            return ProbeResult::Failed("no audio track".into());
+            return ProbeResult::Failed;
         };
         if track.codec_params.codec != CODEC_TYPE_ALAC {
             self.last_error = "codec is not ALAC".into();
@@ -390,14 +406,13 @@ impl Session {
             .unwrap_or(2);
         self.host_n_frames = track.codec_params.n_frames;
 
-        let decoder = match symphonia::default::get_codecs().make(
-            &track.codec_params,
-            &DecoderOptions::default(),
-        ) {
+        let decoder = match symphonia::default::get_codecs()
+            .make(&track.codec_params, &DecoderOptions::default())
+        {
             Ok(d) => d,
             Err(e) => {
                 self.last_error = format!("decoder init: {e}");
-                return ProbeResult::Failed(format!("decoder init: {e}"));
+                return ProbeResult::Failed;
             }
         };
 
@@ -410,25 +425,25 @@ impl Session {
         };
         let Some(trak) = find_box(&moov, b"trak") else {
             self.last_error = "no trak atom".into();
-            return ProbeResult::Failed("no trak atom".into());
+            return ProbeResult::Failed;
         };
         let Some(mdia) = find_box(trak, b"mdia") else {
             self.last_error = "no mdia atom".into();
-            return ProbeResult::Failed("no mdia atom".into());
+            return ProbeResult::Failed;
         };
         let Some(minf) = find_box(mdia, b"minf") else {
             self.last_error = "no minf atom".into();
-            return ProbeResult::Failed("no minf atom".into());
+            return ProbeResult::Failed;
         };
         let Some(stbl) = find_box(minf, b"stbl") else {
             self.last_error = "no stbl atom".into();
-            return ProbeResult::Failed("no stbl atom".into());
+            return ProbeResult::Failed;
         };
         let samples = match Self::parse_samples(stbl) {
             Some(s) if !s.is_empty() => s,
             _ => {
                 self.last_error = "empty sample table".into();
-                return ProbeResult::Failed("empty sample table".into());
+                return ProbeResult::Failed;
             }
         };
 
@@ -457,9 +472,9 @@ impl Session {
             let mut i = 0usize;
             while i + 8 <= chunk.len() {
                 if &chunk[i + 4..i + 8] == HEADER {
-                    let size = u32::from_be_bytes([
-                        chunk[i], chunk[i + 1], chunk[i + 2], chunk[i + 3],
-                    ]) as usize;
+                    let size =
+                        u32::from_be_bytes([chunk[i], chunk[i + 1], chunk[i + 2], chunk[i + 3]])
+                            as usize;
                     let box_off = *chunk_start + i as u64;
                     // Accept a header seen mid-file too; box may span chunks.
                     candidates.push((box_off, size));
@@ -505,29 +520,26 @@ impl Session {
                     ProbeResult::Ready => break,
                     ProbeResult::NeedMoreBytes => return Err(PollOutcome::NeedMoreBytes),
                     ProbeResult::NotAlac => return Err(PollOutcome::NotAlac),
-                    ProbeResult::Failed(reason) => {
-                        let r = reason.clone();
-                        self.state = SessionState::Failed(reason);
-                        return Err(PollOutcome::Failed(r));
+                    ProbeResult::Failed => {
+                        self.state = SessionState::Failed;
+                        return Err(PollOutcome::Failed);
                     }
                 },
-                SessionState::Failed(reason) => {
-                    return Err(PollOutcome::Failed(reason.clone()));
-                }
-                SessionState::Ended => return Err(PollOutcome::Ended),
+                SessionState::Failed => return Err(PollOutcome::Failed),
                 SessionState::Ready { .. } => break,
             }
         }
 
         let (decoder, samples, next_sample) = match &mut self.state {
-            SessionState::Ready { decoder, samples, next_sample } => {
-                (decoder, samples, next_sample)
-            }
+            SessionState::Ready {
+                decoder,
+                samples,
+                next_sample,
+            } => (decoder, samples, next_sample),
             _ => unreachable!(),
         };
 
         if *next_sample >= samples.len() {
-            self.state = SessionState::Ended;
             return Err(PollOutcome::Ended);
         }
         let sample = samples[*next_sample];
@@ -555,10 +567,11 @@ impl Session {
         let decoded = match decoder.decode(&packet) {
             Ok(d) => d,
             Err(e) => {
-                // Skip a corrupt packet rather than aborting the stream.
-                *next_sample += 1;
-                log::debug!("decode error: {e}");
-                return Err(PollOutcome::NeedMoreBytes);
+                self.last_error = format!(
+                    "ALAC packet {} at byte {}: {e}",
+                    *next_sample, sample.offset
+                );
+                return Err(PollOutcome::Failed);
             }
         };
 
@@ -575,40 +588,41 @@ impl Session {
         buf.copy_interleaved_ref(decoded);
         let written = buf.samples();
         if written.len() > out.len() {
-            return Err(PollOutcome::NeedBiggerBuffer(written.len()));
+            return Err(PollOutcome::NeedBiggerBuffer);
         }
         out[..written.len()].copy_from_slice(written);
         self.host_sample_rate = spec.rate;
         self.host_channels = spec.channels.count() as u16;
         *next_sample += 1;
+        let discard_before = samples
+            .get(*next_sample)
+            .map(|next| next.offset)
+            .unwrap_or_else(|| self.pool.lock().unwrap().total);
+        self.pool.lock().unwrap().discard_before(discard_before);
         Ok(frames as u32)
     }
 
-    fn info_json(&self) -> String {
+    fn info_json(&self) -> Option<String> {
+        if !matches!(self.state, SessionState::Ready { .. }) {
+            return None;
+        }
         let duration = self
             .host_n_frames
             .map(|frames| frames as f64 / self.host_sample_rate as f64)
             .unwrap_or(0.0);
-        format!(
+        Some(format!(
             r#"{{"sampleRate":{},"channels":{},"duration":{}}}"#,
             self.host_sample_rate, self.host_channels, duration
-        )
+        ))
     }
 
     fn seek_secs(&mut self, secs: f64) -> bool {
-        // After end-of-stream the reader is exhausted; re-probe from the
-        // complete pool, then seek.
-        if matches!(self.state, SessionState::Ended) {
-            if !self.pool_complete() {
-                return false;
-            }
-            self.state = SessionState::Probing;
-            if !matches!(self.probe(), ProbeResult::Ready) {
-                return false;
-            }
-        }
         let (samples, next_sample) = match &mut self.state {
-            SessionState::Ready { samples, next_sample, .. } => (samples.clone(), next_sample),
+            SessionState::Ready {
+                samples,
+                next_sample,
+                ..
+            } => (samples.clone(), next_sample),
             _ => return false,
         };
         let rate = self.host_sample_rate.max(1) as f64;
@@ -628,25 +642,21 @@ impl Session {
         }
         true
     }
-
-    fn reopen_and_seek(&mut self, secs: f64) -> bool {
-        self.seek_secs(secs)
-    }
 }
 
 enum ProbeResult {
     Ready,
     NeedMoreBytes,
     NotAlac,
-    Failed(String),
+    Failed,
 }
 
 enum PollOutcome {
     NeedMoreBytes,
-    NeedBiggerBuffer(usize),
+    NeedBiggerBuffer,
     Ended,
     NotAlac,
-    Failed(String),
+    Failed,
 }
 
 // ---- C ABI exposed to the frontend ----------------------------------------
@@ -724,10 +734,10 @@ pub extern "C" fn alac_poll(sess: *mut Session, out: *mut i32, out_cap: usize) -
     match sess.poll(slice) {
         Ok(frames) => frames as i32,
         Err(PollOutcome::NeedMoreBytes) => 0,
-        Err(PollOutcome::NeedBiggerBuffer(_)) => -3,
+        Err(PollOutcome::NeedBiggerBuffer) => -3,
         Err(PollOutcome::Ended) => -1,
         Err(PollOutcome::NotAlac) => -4,
-        Err(PollOutcome::Failed(_)) => -2,
+        Err(PollOutcome::Failed) => -2,
     }
 }
 
@@ -761,7 +771,12 @@ pub extern "C" fn alac_info(sess: *const Session, buf: *mut u8, cap: usize) -> i
         return -2;
     }
     let sess = unsafe { &*sess };
-    let json = sess.info_json();
+    let Some(json) = sess.info_json() else {
+        // Metadata is not valid until the container probe has completed. In
+        // particular, do not expose Session's 44.1 kHz defaults while a probe
+        // is still waiting for the tail `moov` atom.
+        return -2;
+    };
     let bytes = json.as_bytes();
     if bytes.len() + 1 > cap {
         return -1;

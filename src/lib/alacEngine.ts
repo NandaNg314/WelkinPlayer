@@ -25,15 +25,27 @@ import { AlacDecoder } from "./alacDecoder";
  */
 
 /** Seconds of PCM to buffer ahead of the playhead. */
-const RING_SECONDS = 2.0;
-/** Chunk size for Range fetches. */
-const FETCH_CHUNK = 256 * 1024;
+const RING_SECONDS = 20.0;
+/** Chunk size for Range fetches. Lossless (24-bit/96k) runs ~500-600 KB/s, so
+ *  a small chunk means one loopback Range round-trip every few hundred ms. */
+const FETCH_CHUNK = 1024 * 1024;
 /** i32 sample capacity requested per poll (frames * channels). */
 const POLL_CAP = 65536;
 /** Timeupdate cadence (matches HTMLMediaElement's ~4 Hz). */
 const TIMEUPDATE_MS = 250;
 /** Consecutive fetch failures before surfacing a hard error in the pump. */
-const MAX_FETCH_RETRIES = 20;
+const MAX_FETCH_RETRIES = 5;
+/** Bound a stalled loopback Range request so it can be retried and reported. */
+const RANGE_FETCH_TIMEOUT_MS = 12_000;
+/** PCM seconds that must be queued before playback may start/resume consuming.
+ *  Gate the audio thread on a real reserve so a momentary main-thread stall
+ *  (Vue render, GC) cannot drain the ring to zero and write silence. */
+const PREBUFFER_SECONDS = 1.5;
+/** Once playing, keep at least this much queued; below it we re-arm the gate. */
+const REBUFFER_SECONDS = 0.75;
+/** Recent pump activity used to report HAVE_CURRENT_DATA while a fetch is in
+ *  progress. Playback stalls are detected from timeupdate events in audio.ts. */
+const PIPELINE_ALIVE_MS = 2500;
 
 function isAlacCandidate(path: string): boolean {
   const ext = path.split(".").pop()?.toLowerCase() ?? "";
@@ -62,6 +74,10 @@ export class AlacEngine {
   private totalBytes = 0;
   private closed = true;
   private generation = 0;
+  /** Invalidates a decoded packet if a seek happens while it is being queued. */
+  private bufferGeneration = 0;
+  /** The active Range request, cancelled when a track or seek supersedes it. */
+  private rangeFetchController: AbortController | null = null;
   private pumpRunning = false;
   private decodeFailed = false;
 
@@ -76,6 +92,8 @@ export class AlacEngine {
   private _muted = false;
   private _paused = true;
   private _endedFlag = false;
+  /** Decoder EOF is separate from playback EOF while queued PCM remains. */
+  private inputEnded = false;
   /** True while an ALAC seek is rebuilding its buffer. */
   private _seeking = false;
   private metadataReady = false;
@@ -85,6 +103,7 @@ export class AlacEngine {
   private ringCh1 = new Float32Array(0);
   private ringHead = 0;
   private ringTail = 0;
+  private ringCount = 0;
   private samplesPerChannel = 0;
   private sampleRate = 44100;
   private channels = 2;
@@ -92,7 +111,18 @@ export class AlacEngine {
   private seekBase = 0;
   /** Frames decoded since the last seek — drives the playhead clock. */
   private decodedFrames = 0;
+  /** Fractional source-frame position retained while converting to device rate. */
+  private resamplePhase = 0;
   private lastTimeupdateAt = 0;
+  /**
+   * Timestamp of the last sign of pipeline life (a packet decoded, or bytes
+   * being pulled). It keeps readyState representative while a fetch is in
+   * progress; the stall watchdog checks actual playhead movement.
+   */
+  private lastPipelineAt = 0;
+  private lastProcessLogAt = 0;
+  /** True while the pre-buffer gate is holding consumption back. */
+  private priming = true;
 
   // ---- media-element shaped accessors ------------------------------------
 
@@ -101,6 +131,10 @@ export class AlacEngine {
   }
   get ended(): boolean {
     return this.native?.ended ?? this._endedFlag;
+  }
+  /** True while an ALAC byte range is being read from the proxy. */
+  get waitingForData(): boolean {
+    return this.rangeFetchController !== null;
   }
   get seeking(): boolean {
     return this.native?.seeking ?? this._seeking;
@@ -154,13 +188,20 @@ export class AlacEngine {
   get readyState(): number {
     if (this.native) return this.native.readyState;
     if (!this.metadataReady) return HTMLMediaElement.HAVE_NOTHING;
-    // Judge buffering by buffered TIME, not by "is the ring non-empty": the
-    // audio thread drains the ring in 4096-frame steps and the pump refills it
-    // in bursts, so a non-empty test flickers and the stall watchdog in
-    // audio.ts would repeatedly "recover" (reload) a perfectly healthy track.
+    // Keep this accessor representative of the actual PCM reserve. Playback
+    // progress, rather than this value, is what the stall watchdog measures.
     if (this.bufferedSeconds() >= 0.25) return HTMLMediaElement.HAVE_FUTURE_DATA;
-    if (this.bufferedSeconds() > 0) return HTMLMediaElement.HAVE_CURRENT_DATA;
+    if (this.bufferedSeconds() > 0 || this.pipelineAlive()) {
+      return HTMLMediaElement.HAVE_CURRENT_DATA;
+    }
     return HTMLMediaElement.HAVE_METADATA;
+  }
+
+  /** Whether the download/decode loop has shown activity inside the stall window. */
+  private pipelineAlive(): boolean {
+    if (this._endedFlag || this.decodeFailed || this.closed) return false;
+    if (!this.pumpRunning) return false;
+    return performance.now() - this.lastPipelineAt < PIPELINE_ALIVE_MS;
   }
 
   get src(): string {
@@ -221,6 +262,10 @@ export class AlacEngine {
     if (this.native) return this.native.play();
     this._paused = false;
     this._endedFlag = false;
+    // Create and resume Web Audio synchronously in the play gesture. Creating
+    // the context later, after the decoder's async fetches, can be blocked by
+    // Android WebView's autoplay policy even though play() came from a tap.
+    this.ensureAudioContext();
     this.resumeContext();
     this.dispatch("play");
     return Promise.resolve();
@@ -248,12 +293,40 @@ export class AlacEngine {
   }
 
   pause(): void {
+    this._paused = true;
     if (this.native) {
       this.native.pause();
       return;
     }
-    this._paused = true;
     this.dispatch("pause");
+  }
+
+  private cleanupAudioContext(): void {
+    if (this.processor) {
+      this.processor.disconnect();
+      this.processor.onaudioprocess = null;
+      this.processor = null;
+    }
+    if (this.gain) {
+      this.gain.disconnect();
+      this.gain = null;
+    }
+    if (this.ctx) {
+      void this.ctx.close().catch(() => {});
+      this.ctx = null;
+    }
+  }
+
+  private ensureAudioContext(): void {
+    if (this.ctx) return;
+    this.ctx = new AudioContext();
+    this.gain = this.ctx.createGain();
+    this.gain.gain.value = this._muted ? 0 : this._volume;
+    this.gain.connect(this.ctx.destination);
+    // The ring is always converted to stereo, including mono ALAC sources.
+    this.processor = this.ctx.createScriptProcessor(4096, 0, 2);
+    this.processor.onaudioprocess = (event) => this.onAudioProcess(event);
+    this.processor.connect(this.gain);
   }
 
   // ---- non-ALAC fallback ----------------------------------------------------
@@ -262,29 +335,65 @@ export class AlacEngine {
    * Hand the track to an internal `<audio>` element. Emits a `loadedmetadata`
    * after the native element reports it, so callers see a consistent flow.
    */
-  private fallbackToNative(): void {
+  private fallbackToNative(reason = "unknown"): void {
+    console.log("[alac] fallbackToNative called, reason=", reason);
     if (this.native || !this.streamUrl) return;
+    this.cleanupAudioContext();
+
     const native = new Audio();
     native.preload = "metadata";
     native.volume = this._volume;
     native.muted = this._muted;
     for (const type of NATIVE_EVENTS) {
-      native.addEventListener(type, () => this.dispatch(type));
+      native.addEventListener(type, () => {
+        if (this.native === native) {
+          if (type === "ended") {
+            console.log("[alac] native fallback fired ended!");
+          }
+          this.dispatch(type);
+        }
+      });
     }
     native.addEventListener("loadedmetadata", () => {
-      this._duration = Number.isFinite(native.duration) && native.duration > 0 ? native.duration : 0;
+      if (this.native === native) {
+        this._duration = Number.isFinite(native.duration) && native.duration > 0 ? native.duration : 0;
+      }
     });
     this.native = native;
     native.src = this.streamUrl;
     native.load();
+
+    if (!this._paused) {
+      native.play().catch((error) => {
+        console.warn("[alac] native fallback play failed", error);
+      });
+    }
   }
 
   // ---- pipeline ------------------------------------------------------------
 
   private async start(): Promise<void> {
     if (!this.streamUrl) return;
+    this.abortRangeFetch();
     this.closed = false;
     const generation = ++this.generation;
+    this.bufferGeneration += 1;
+    this.pumpRunning = false;
+    this.totalBytes = 0;
+    this.metadataReady = false;
+    this.decodeFailed = false;
+    this.fetchFailures = 0;
+    this._duration = 0;
+    this._currentTime = 0;
+    this._endedFlag = false;
+    this.inputEnded = false;
+    this._seeking = false;
+    this.ringHead = 0;
+    this.ringTail = 0;
+    this.ringCount = 0;
+    this.resamplePhase = 0;
+    this.priming = true;
+    this.decoder.close();
 
     // A new src invalidates any previous native fallback element: if a
     // previous track was AAC (played via the internal <audio>), that element
@@ -292,15 +401,17 @@ export class AlacEngine {
     // this track, and it must then create a fresh native bound to the NEW
     // url — otherwise switching tracks keeps replaying the previous song.
     if (this.native) {
-      this.native.pause();
-      this.native.removeAttribute("src");
-      this.native.load();
+      const old = this.native;
       this.native = null;
+      old.pause();
+      old.removeAttribute("src");
+      old.load();
     }
 
     try {
       await this.decoder.load("alac.wasm");
     } catch (error) {
+      if (generation !== this.generation || this.closed) return;
       console.error("[alac] wasm load failed, falling back to native audio", error);
       this.fallbackToNative();
       return;
@@ -308,37 +419,32 @@ export class AlacEngine {
     if (generation !== this.generation || this.closed) return;
 
     this.totalBytes = await this.probeFileSize();
+    console.log("[alac] probeFileSize result: totalBytes=", this.totalBytes);
     if (generation !== this.generation || this.closed) return;
     if (this.totalBytes <= 0) {
       console.warn("[alac] could not determine file size, falling back to native audio");
-      this.fallbackToNative();
+      this.fallbackToNative("no-file-size");
       return;
     }
 
-    if (!this.ctx) {
-      this.ctx = new AudioContext();
-      this.gain = this.ctx.createGain();
-      this.gain.gain.value = this._muted ? 0 : this._volume;
-      this.gain.connect(this.ctx.destination);
-      // Fixed 2-channel output: ALAC sources may be mono, but the ring is
-      // always converted to stereo (`pushPcm` duplicates channel 0), so the
-      // processor must be created for 2 channels regardless of the source.
-      this.processor = this.ctx.createScriptProcessor(4096, 0, 2);
-      this.processor.onaudioprocess = (event) => this.onAudioProcess(event);
-      this.processor.connect(this.gain);
-    }
-    // The context is created asynchronously, possibly after `play()` already
-    // asked to start; make sure it is actually running now.
+    this.ensureAudioContext();
+    // If playback began before the context existed, retry after setup. When
+    // started by a tap, play() already created it synchronously in that gesture.
     this.resumeContext();
 
     this.decoder.open(this.totalBytes);
     this.metadataReady = false;
     this._duration = 0;
     this._endedFlag = false;
+    this.inputEnded = false;
     this.ringHead = 0;
     this.ringTail = 0;
+    this.ringCount = 0;
+    this.resamplePhase = 0;
     this.seekBase = 0;
     this.decodedFrames = 0;
+    this.priming = true;
+    this.lastPipelineAt = performance.now();
 
     // Set `pumpRunning` BEFORE the async pump starts its first await; a
     // `seekTo` arriving mid-startup would otherwise see it false and launch a
@@ -348,21 +454,28 @@ export class AlacEngine {
   }
 
   private stop(): void {
+    this.abortRangeFetch();
     this.closed = true;
     this.generation += 1;
+    this.bufferGeneration += 1;
     this.pumpRunning = false;
     this.ringHead = 0;
     this.ringTail = 0;
+    this.ringCount = 0;
+    this.priming = true;
     this.decoder.close();
     this.metadataReady = false;
     this._endedFlag = false;
+    this.inputEnded = false;
     this._paused = true;
     this.decodeFailed = false;
+    this.cleanupAudioContext();
     if (this.native) {
-      this.native.pause();
-      this.native.removeAttribute("src");
-      this.native.load();
+      const old = this.native;
       this.native = null;
+      old.pause();
+      old.removeAttribute("src");
+      old.load();
     }
   }
 
@@ -372,34 +485,85 @@ export class AlacEngine {
       const response = await fetch(this.streamUrl, {
         headers: { Range: "bytes=0-0" },
       });
-      if (!response.ok) return 0;
+      if (response.status !== 206) return 0;
       const contentRange = response.headers.get("content-range");
-      const match = contentRange?.match(/\/(\d+)\s*$/);
-      if (match) return Number(match[1]);
-      const length = response.headers.get("content-length");
-      return length ? Number(length) : 0;
+      const match = contentRange?.match(/^bytes 0-0\/(\d+)$/i);
+      return match ? Number(match[1]) : 0;
     } catch {
       return 0;
     }
   }
 
   /** Fetch bytes [start, start+chunk) and feed them to the decoder. */
-  private async fetchAndFeed(start: number, chunk: number): Promise<boolean> {
+  private async fetchAndFeed(
+    start: number,
+    chunk: number,
+    generation: number,
+    bufferGeneration: number,
+  ): Promise<boolean> {
     const end = Math.min(start + chunk, this.totalBytes);
-    if (start >= end) return false;
+    if (start >= end) {
+      console.log("[alac] fetchAndFeed EOF: start=", start, "end=", end, "totalBytes=", this.totalBytes);
+      return false;
+    }
+    const controller = new AbortController();
+    this.rangeFetchController = controller;
+    const timeout = window.setTimeout(() => controller.abort(), RANGE_FETCH_TIMEOUT_MS);
+    const isCurrent = () =>
+      generation === this.generation &&
+      bufferGeneration === this.bufferGeneration &&
+      !this.closed;
     try {
       const response = await fetch(this.streamUrl, {
         headers: { Range: `bytes=${start}-${end - 1}` },
+        signal: controller.signal,
       });
-      if (!response.ok) return false;
+      if (!isCurrent()) return false;
+      const contentRange = response.headers.get("content-range");
+      const match = contentRange?.match(/^bytes\s+(\d+)-(\d+)\/(\d+)\s*$/i);
+      if (
+        response.status !== 206 ||
+        !match ||
+        Number(match[1]) !== start ||
+        Number(match[2]) !== end - 1 ||
+        Number(match[3]) !== this.totalBytes
+      ) {
+        console.warn("[alac] invalid Range response:", {
+          status: response.status,
+          contentRange,
+          expected: `bytes ${start}-${end - 1}/${this.totalBytes}`,
+        });
+        return false;
+      }
       const buffer = await response.arrayBuffer();
-      if (buffer.byteLength === 0) return false;
+      if (!isCurrent()) return false;
+      if (buffer.byteLength !== end - start) {
+        console.warn("[alac] incomplete Range response:", buffer.byteLength, contentRange);
+        return false;
+      }
+      console.log("[alac] fetchAndFeed OK: bytes=", buffer.byteLength, `[${start}..${start + buffer.byteLength})`);
       this.decoder.feed(start, new Uint8Array(buffer));
       return true;
     } catch (error) {
+      // A track switch or seek intentionally cancels the old request.
+      if (!isCurrent()) return false;
+      if (controller.signal.aborted) {
+        console.warn("[alac] Range request timed out:", `bytes=${start}-${end - 1}`);
+        return false;
+      }
       console.warn("[alac] fetch failed", error);
       return false;
+    } finally {
+      window.clearTimeout(timeout);
+      if (this.rangeFetchController === controller) {
+        this.rangeFetchController = null;
+      }
     }
+  }
+
+  private abortRangeFetch(): void {
+    this.rangeFetchController?.abort();
+    this.rangeFetchController = null;
   }
 
   /** Download + decode loop; runs until the ring is full, the track ends,
@@ -408,58 +572,68 @@ export class AlacEngine {
   private fetchFailures = 0;
 
   private async pump(generation: number): Promise<void> {
+    console.log("[alac] pump started: generation=", generation, "totalBytes=", this.totalBytes);
     const pcm = new Int32Array(POLL_CAP);
 
     while (generation === this.generation && !this.closed) {
       // Respect the play/pause state: when paused we stop making progress on
       // the playhead but keep the decoder warm (the ring stays refillable so
       // resume is instant). We still poll to keep the buffer filled.
+      const bufferGeneration = this.bufferGeneration;
       const result = this.decoder.pollOnce(pcm);
 
       if (result > 0) {
         this.fetchFailures = 0;
+        this.lastPipelineAt = performance.now();
+        let metadataEvent = false;
         if (!this.metadataReady) {
           this.metadataReady = true;
+          metadataEvent = true;
           const info = this.decoder.metadata;
           if (info) {
             this.sampleRate = info.sampleRate;
+            this.resamplePhase = 0;
             this.channels = info.channels;
             this._duration = info.duration > 0 ? info.duration : 0;
             this.allocRing();
+            console.log("[alac] metadata ready: sampleRate=", this.sampleRate, "channels=", this.channels, "duration=", this._duration);
           }
+        }
+        await this.pushPcm(pcm, result, generation, bufferGeneration);
+        if (
+          metadataEvent &&
+          generation === this.generation &&
+          bufferGeneration === this.bufferGeneration
+        ) {
+          // Dispatch after the first decoded packet is queued. A pending seek
+          // from the loadedmetadata handler can now clear it without letting a
+          // stale pre-seek packet play afterward.
           this.dispatch("loadedmetadata");
           this.dispatch("durationchange");
         }
-        this.pushPcm(pcm, result);
-        // Only advance the playhead while actually playing.
-        if (!this._paused) {
-          this.decodedFrames += result;
-          this._currentTime = this.seekBase + this.decodedFrames / this.sampleRate;
-          this.maybeTimeupdate();
-        }
       } else if (result === AlacPoll.NeedMoreBytes) {
-        // Pull the region the demuxer wants. If a lot of audio is already
-        // buffered (decoded but not yet played), throttle the download so a
-        // phone does not grab the whole file in one burst.
-        if (this.bufferedSeconds() > RING_SECONDS * 2) {
+        // Pull the region the demuxer wants. Once a comfortable reserve is
+        // queued, stop fetching so a phone does not pull the whole lossless
+        // file in one burst; the loop wakes when playback drains below the
+        // reserve. (`ringFull()` below is the coarse brake; this one keeps the
+        // buffer near the top instead of sawtoothing.)
+        if (this.bufferedSeconds() >= RING_SECONDS * 0.8) {
           await sleep(150);
           continue;
         }
         const need = this.decoder.needOffset();
         const start = Math.min(Math.max(need, 0), this.totalBytes);
-        const ok = await this.fetchAndFeed(start, FETCH_CHUNK);
+        console.log("[alac] NeedMoreBytes: needOffset=", need, "start=", start, "buffered=", this.bufferedSeconds().toFixed(2));
+        const ok = await this.fetchAndFeed(start, FETCH_CHUNK, generation, bufferGeneration);
+        if (generation !== this.generation || this.closed) return;
+        if (bufferGeneration !== this.bufferGeneration) continue;
         if (!ok) {
-          if (this.decoder.isComplete) {
-            this._endedFlag = true;
-            this.pumpRunning = false;
-            this.dispatch("ended");
-            return;
-          }
           // A persistent failure (bad token after a proxy restart, a Range the
           // proxy rejects, network drop) must not retry forever: after a
           // budget, surface a real error instead of spinning silently.
           this.fetchFailures += 1;
           if (this.fetchFailures >= MAX_FETCH_RETRIES) {
+            console.warn("[alac] pump fetch failed max retries, dispatching error");
             this.decodeFailed = true;
             this.pumpRunning = false;
             this.dispatch("error");
@@ -468,17 +642,27 @@ export class AlacEngine {
           await sleep(250);
           continue;
         }
+        this.lastPipelineAt = performance.now();
       } else if (result === AlacPoll.Ended) {
-        this._endedFlag = true;
+        // The demuxer can reach file EOF while the final decoded PCM is still
+        // queued. Keep the pump closed, but report media `ended` only after the
+        // audio callback has drained that tail so the playlist cannot cut it.
+        console.log("[alac] decoder reached EOF; waiting for queued PCM:", "ringCount=", this.ringCount, "currentTime=", this._currentTime);
+        this.inputEnded = true;
         this.pumpRunning = false;
-        this.dispatch("ended");
+        this.finishIfDrained();
         return;
       } else if (result === AlacPoll.NotAlac) {
         // The container is not ALAC (e.g. AAC in m4a): switch to native audio.
+        console.log("[alac] container is NotAlac, falling back to native audio");
         this.pumpRunning = false;
-        this.fallbackToNative();
+        this.fallbackToNative("not-alac");
         return;
       } else {
+        const diag = this.decoder.readError();
+        if (diag) {
+          console.warn("[alac] decoder error:", diag);
+        }
         // Fatal decode/probe error. If we never even got metadata, the file
         // may simply be an m4a whose ALAC probe failed (a non-ALAC container
         // we could not classify) — give the native element a chance instead
@@ -510,39 +694,70 @@ export class AlacEngine {
     this.ringCh1 = new Float32Array(capacity);
     this.ringHead = 0;
     this.ringTail = 0;
+    this.ringCount = 0;
+    // A fresh (empty) ring has no reserve yet, so the gate must hold.
+    this.priming = true;
   }
 
   /** Convert one interleaved i32 packet into planar f32 and push to the ring. */
-  private pushPcm(pcm: Int32Array, frames: number): void {
+  private async pushPcm(
+    pcm: Int32Array,
+    frames: number,
+    generation: number,
+    bufferGeneration: number,
+  ): Promise<void> {
     if (this.samplesPerChannel === 0) this.allocRing();
-    const writeFrames = Math.min(frames, this.availableWrite());
+    let written = 0;
     const ch = this.channels >= 2 ? 2 : 1;
-    for (let index = 0; index < writeFrames; index += 1) {
-      const base = index * this.channels;
-      const target = (this.ringHead + index) % this.samplesPerChannel;
-      this.ringCh0[target] = pcm[base] / 2147483648;
-      this.ringCh1[target] = ch > 1 ? pcm[base + 1] / 2147483648 : pcm[base] / 2147483648;
-    }
-    this.ringHead = (this.ringHead + writeFrames) % this.samplesPerChannel;
-  }
+    const capacity = this.samplesPerChannel;
+    // Multiply by the reciprocal instead of dividing per sample: a phone decodes
+    // 96k+ of these and the divide cost shows up on the main thread.
+    const scale = 1 / 2147483648;
 
-  private availableWrite(): number {
-    if (this.samplesPerChannel === 0) return 0;
-    let available = this.ringTail - this.ringHead;
-    if (available <= 0) available += this.samplesPerChannel;
-    return Math.min(available, this.samplesPerChannel);
+    while (
+      written < frames &&
+      generation === this.generation &&
+      bufferGeneration === this.bufferGeneration &&
+      !this.closed
+    ) {
+      const available = capacity - this.ringCount;
+      if (available <= 0) {
+        await sleep(20);
+        continue;
+      }
+      const toWrite = Math.min(frames - written, available);
+      // Split the write at the wrap point so the inner loops index contiguously
+      // with no per-sample modulo.
+      const untilWrap = capacity - this.ringHead;
+      const first = Math.min(toWrite, untilWrap);
+      let head = this.ringHead;
+      for (let index = 0; index < first; index += 1) {
+        const base = (written + index) * this.channels;
+        this.ringCh0[head] = pcm[base] * scale;
+        this.ringCh1[head] = ch > 1 ? pcm[base + 1] * scale : pcm[base] * scale;
+        head += 1;
+      }
+      const second = toWrite - first;
+      for (let index = 0; index < second; index += 1) {
+        const base = (written + first + index) * this.channels;
+        this.ringCh0[index] = pcm[base] * scale;
+        this.ringCh1[index] = ch > 1 ? pcm[base + 1] * scale : pcm[base] * scale;
+      }
+      this.ringHead = (this.ringHead + toWrite) % capacity;
+      this.ringCount += toWrite;
+      written += toWrite;
+    }
   }
 
   private ringFull(): boolean {
-    return this.availableWrite() < this.sampleRate / 2;
+    if (this.samplesPerChannel === 0) return false;
+    return (this.samplesPerChannel - this.ringCount) < this.sampleRate / 2;
   }
 
   /** Seconds of PCM currently queued in the ring (decoded but unplayed). */
   private bufferedSeconds(): number {
     if (this.samplesPerChannel === 0) return 0;
-    let queued = this.ringHead - this.ringTail;
-    if (queued < 0) queued += this.samplesPerChannel;
-    return queued / this.sampleRate;
+    return this.ringCount / this.sampleRate;
   }
 
   private onAudioProcess(event: AudioProcessingEvent): void {
@@ -558,16 +773,123 @@ export class AlacEngine {
       outR.fill(0);
       return;
     }
-    for (let index = 0; index < n; index += 1) {
-      if (this.ringHead === this.ringTail) {
-        outL[index] = 0;
-        outR[index] = 0;
-        continue;
+    // Pre-buffer gate: do not start consuming until a real reserve is queued,
+    // and re-arm it after an underrun. Without this the audio thread begins
+    // draining the instant one packet lands and then runs at the water line —
+    // any main-thread hitch (Vue render, GC, a big pushPcm burst) drains the
+    // ring to zero and we write silence, heard as "一卡一卡".
+    const buffered = this.bufferedSeconds();
+    if (!this.inputEnded) {
+      if (this.priming) {
+        if (buffered >= PREBUFFER_SECONDS) {
+          this.priming = false;
+        } else {
+          outL.fill(0);
+          outR.fill(0);
+          return;
+        }
+      } else if (buffered < REBUFFER_SECONDS) {
+        this.priming = true;
+        outL.fill(0);
+        outR.fill(0);
+        return;
       }
-      outL[index] = this.ringCh0[this.ringTail];
-      outR[index] = this.ringCh1[this.ringTail];
-      this.ringTail = (this.ringTail + 1) % this.samplesPerChannel;
     }
+    // ALAC PCM is in the file's sample rate, while WebAudio's output rate is
+    // fixed by the Android device (commonly 48 kHz). Writing 96 kHz samples
+    // one-for-one into a 48 kHz context halves both pitch and playback speed.
+    // Convert source frames to the device rate before writing the output.
+    const outputRate = this.ctx?.sampleRate || this.sampleRate;
+    const ratio = this.sampleRate / outputRate;
+    let sourceFramesConsumed = 0;
+    let outputFramesWritten = 0;
+    const phase = this.resamplePhase;
+    const ringSample = (channel: Float32Array, offset: number) => channel[(this.ringTail + offset) % this.samplesPerChannel];
+
+    if (ratio >= 1) {
+      // A weighted box filter averages each source interval. In the common
+      // 96 kHz -> 48 kHz case this averages pairs, avoiding harsh aliasing.
+      const available = Math.min(n, this.inputEnded
+        ? Math.max(0, Math.ceil((this.ringCount - phase) / ratio))
+        : Math.max(0, Math.floor((this.ringCount - phase) / ratio)));
+      for (let index = 0; index < available; index += 1) {
+        const start = phase + index * ratio;
+        const end = this.inputEnded ? Math.min(start + ratio, this.ringCount) : start + ratio;
+        const first = Math.floor(start);
+        const last = Math.ceil(end);
+        let sumL = 0;
+        let sumR = 0;
+        const interval = end - start;
+        for (let source = first; source < last; source += 1) {
+          const weight = Math.min(end, source + 1) - Math.max(start, source);
+          if (weight <= 0) continue;
+          sumL += ringSample(this.ringCh0, source) * weight;
+          sumR += ringSample(this.ringCh1, source) * weight;
+        }
+        outL[index] = sumL / interval;
+        outR[index] = sumR / interval;
+      }
+      outputFramesWritten = available;
+      const advanced = phase + available * ratio;
+      sourceFramesConsumed = this.inputEnded
+        ? Math.min(this.ringCount, Math.floor(advanced))
+        : Math.floor(advanced);
+      this.resamplePhase = sourceFramesConsumed >= this.ringCount ? 0 : advanced - sourceFramesConsumed;
+    } else {
+      // Linear interpolation for upsampling; retain one look-ahead frame in
+      // the ring so a packet boundary never produces a discontinuity.
+      const available = Math.min(n, this.inputEnded
+        ? Math.max(0, Math.ceil((this.ringCount - phase) / ratio))
+        : Math.max(0, Math.floor((this.ringCount - 1 - phase) / ratio) + 1));
+      for (let index = 0; index < available; index += 1) {
+        const position = phase + index * ratio;
+        const lower = this.inputEnded
+          ? Math.min(this.ringCount - 1, Math.floor(position))
+          : Math.floor(position);
+        const upper = this.inputEnded ? Math.min(this.ringCount - 1, lower + 1) : lower + 1;
+        const fraction = upper === lower ? 0 : position - lower;
+        const left0 = ringSample(this.ringCh0, lower);
+        const right0 = ringSample(this.ringCh1, lower);
+        const left1 = ringSample(this.ringCh0, upper);
+        const right1 = ringSample(this.ringCh1, upper);
+        outL[index] = left0 + (left1 - left0) * fraction;
+        outR[index] = right0 + (right1 - right0) * fraction;
+      }
+      outputFramesWritten = available;
+      const advanced = phase + available * ratio;
+      sourceFramesConsumed = this.inputEnded
+        ? Math.min(this.ringCount, Math.floor(advanced))
+        : Math.floor(advanced);
+      this.resamplePhase = sourceFramesConsumed >= this.ringCount ? 0 : advanced - sourceFramesConsumed;
+    }
+
+    this.ringTail = (this.ringTail + sourceFramesConsumed) % this.samplesPerChannel;
+    this.ringCount -= sourceFramesConsumed;
+    if (outputFramesWritten < n) {
+      outL.fill(0, outputFramesWritten);
+      outR.fill(0, outputFramesWritten);
+    }
+    if (outputFramesWritten > 0) {
+      // Advance by output time, not an integer-rounded count of source frames.
+      this.decodedFrames += outputFramesWritten * ratio;
+      this._currentTime = this.seekBase + this.decodedFrames / this.sampleRate;
+      this.maybeTimeupdate();
+      const now = performance.now();
+      if (now - this.lastProcessLogAt > 2000) {
+        this.lastProcessLogAt = now;
+        console.log(`[alac] audioProcess: pos=${this._currentTime.toFixed(1)}/${this._duration.toFixed(1)}s, sourceRate=${this.sampleRate}, outputRate=${outputRate}, ringCount=${this.ringCount}, buffered=${buffered.toFixed(2)}s, priming=${this.priming}`);
+      }
+    }
+    this.finishIfDrained();
+  }
+
+  /** Emit the media-element ended event only after the final PCM was rendered. */
+  private finishIfDrained(): void {
+    if (!this.inputEnded || this._endedFlag || this.ringCount > 0 || this._paused || this.closed) return;
+    this._endedFlag = true;
+    if (this._duration > 0) this._currentTime = this._duration;
+    this.dispatch("timeupdate");
+    this.dispatch("ended");
   }
 
   private maybeTimeupdate(): void {
@@ -584,12 +906,25 @@ export class AlacEngine {
     }
     if (!this.metadataReady || !this._duration) return;
     const clamped = Math.min(Math.max(0, seconds), this._duration);
+    this.abortRangeFetch();
+    this.bufferGeneration += 1;
     this.ringHead = 0;
     this.ringTail = 0;
+    this.ringCount = 0;
+    this.resamplePhase = 0;
     this.seekBase = clamped;
     this.decodedFrames = 0;
     this._currentTime = clamped;
-    this.decoder.seek(clamped);
+    this.inputEnded = false;
+    // Re-prime: the ring was cleared, so rebuild the reserve before resuming.
+    this.priming = true;
+    if (!this.decoder.seek(clamped)) {
+      this._seeking = false;
+      this.decodeFailed = true;
+      this.pumpRunning = false;
+      this.dispatch("error");
+      return;
+    }
     this._endedFlag = false;
     // Mark seeking so audio.ts's stall watchdog does not mistake the refill
     // window for a stall and force a reload mid-seek.

@@ -42,10 +42,40 @@ export class AlacDecoder {
     return this.instance.exports as Record<string, unknown>;
   }
 
+  /**
+   * Read (and clear) the decoder's last diagnostic string.
+   *
+   * `alac_poll` collapses every failure — an unrecognised container, a missing
+   * ALAC magic cookie, an unsupported bit depth — into the single code `-2`,
+   * which on a real device is indistinguishable from "this file is broken".
+   * This surfaces the message the Rust side already recorded, so a failing
+   * track can be diagnosed from `adb logcat` instead of guessed at.
+   */
+  readError(): string {
+    if (!this.session) return "";
+    const cap = 256;
+    const ptr = this.call("alac_alloc", cap);
+    if (!ptr) return "";
+    let text = "";
+    try {
+      const len = this.call("alac_last_error", this.session, ptr, cap);
+      if (len > 0) {
+        text = new TextDecoder().decode(
+          new Uint8Array(this.memory!.buffer, ptr, Math.min(len, cap)),
+        );
+      }
+    } catch {
+      text = "";
+    }
+    this.call("alac_free", ptr, cap);
+    return text;
+  }
+
   private call(name: string, ...args: Array<number | bigint>): number {
-    const fn = this.exports[name] as ((...a: Array<number | bigint>) => number) | undefined;
+    const fn = this.exports[name] as ((...a: Array<number | bigint>) => number | bigint) | undefined;
     if (!fn) throw new Error(`alac: missing export ${name}`);
-    return fn(...args);
+    const res = fn(...args);
+    return typeof res === "bigint" ? Number(res) : res;
   }
 
   async load(wasmUrl: string): Promise<void> {
@@ -66,7 +96,7 @@ export class AlacDecoder {
   /** Start a decoding session for a file of `totalBytes`. */
   open(totalBytes: number): void {
     this.close();
-    this.session = this.call("alac_open", totalBytes);
+    this.session = this.call("alac_open", BigInt(Math.max(0, Math.floor(totalBytes))));
     if (!this.session) throw new Error("alac: open failed");
     this.info = null;
   }
@@ -86,7 +116,7 @@ export class AlacDecoder {
     const ptr = this.call("alac_alloc", bytes.byteLength);
     if (!ptr) throw new Error("alac: alloc failed");
     new Uint8Array(this.memory!.buffer, ptr, bytes.byteLength).set(bytes);
-    this.call("alac_feed", this.session, offset, ptr, bytes.byteLength);
+    this.call("alac_feed", this.session, BigInt(Math.max(0, Math.floor(offset))), ptr, bytes.byteLength);
     this.call("alac_free", ptr, bytes.byteLength);
   }
 

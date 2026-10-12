@@ -262,6 +262,21 @@ html[data-accent="blue"] {
     transition: height 160ms cubic-bezier(0.2, 0.8, 0.2, 1);
   }
 
+  /* Large touch target around the seek rail; only the painted rail stays thin. */
+  .seek-slider {
+    height: 24px;
+    background-color: transparent;
+    background-size: 100% 4px;
+    background-position: center;
+    background-repeat: no-repeat;
+    touch-action: pan-y;
+  }
+
+  .seek-slider:disabled {
+    cursor: default;
+    opacity: 0.55;
+  }
+
   .ak-slider::-webkit-slider-thumb {
     -webkit-appearance: none;
     width: 14px;
@@ -291,7 +306,9 @@ html[data-accent="blue"] {
 
   .ak-slider:hover::-webkit-slider-thumb,
   .ak-slider:focus-visible::-webkit-slider-thumb,
-  .ak-slider:hover::-moz-range-thumb {
+  .ak-slider:hover::-moz-range-thumb,
+  .seek-slider-active::-webkit-slider-thumb,
+  .seek-slider-active::-moz-range-thumb {
     opacity: 1;
     transform: scale(1.15);
   }

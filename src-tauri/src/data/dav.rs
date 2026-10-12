@@ -24,7 +24,9 @@ use zeroize::Zeroizing;
 
 use crate::core::error::AppError;
 
-const AUDIO_EXTENSIONS: [&str; 9] = ["mp3", "flac", "m4a", "ogg", "wav", "aac", "opus", "wma", "alac"];
+const AUDIO_EXTENSIONS: [&str; 9] = [
+    "mp3", "flac", "m4a", "ogg", "wav", "aac", "opus", "wma", "alac",
+];
 
 /// Maximum number of PROPFIND requests kept in flight while walking a library.
 const LIST_CONCURRENCY: usize = 8;
@@ -791,7 +793,10 @@ mod tests {
     #[test]
     fn accepts_collection_root_without_trailing_slash() {
         let client = WebDavClient::new("https://host/webdav", "user", "pass").unwrap();
-        assert_eq!(client.resolve("/webdav").unwrap().as_str(), "https://host/webdav");
+        assert_eq!(
+            client.resolve("/webdav").unwrap().as_str(),
+            "https://host/webdav"
+        );
     }
 
     #[test]

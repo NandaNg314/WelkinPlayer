@@ -20,9 +20,9 @@ use serde::Serialize;
 use tauri::AppHandle;
 use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 
-use crate::data::backend::{content_type_for, safe_join};
 use crate::commands::media::asset_hash;
 use crate::commands::webdav::{enforce_url_policy, source_password};
+use crate::data::backend::{content_type_for, safe_join};
 use crate::data::dav::resolve_under_base;
 use crate::data::sources::find_source;
 use crate::streaming::smart_cache::{SmartCache, SmartCandidate};
@@ -69,7 +69,11 @@ pub fn start(app: AppHandle) -> Result<StreamProxy, String> {
     let thread_cache = cache.clone();
     let thread_smart = smart.clone();
     std::thread::spawn(move || {
-        let client = match Client::builder().build() {
+        let client = match Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .timeout(std::time::Duration::from_secs(10))
+            .build()
+        {
             Ok(client) => Arc::new(client),
             Err(error) => {
                 log::error!("streaming proxy client failed: {error}");
@@ -155,6 +159,14 @@ fn handle(
         .iter()
         .find(|header| header.field.equiv("Range"))
         .map(|header| header.value.as_str().to_string());
+
+    // Keep proxy diagnostics useful without logging the private WebDAV path or
+    // the per-launch token carried in the query string.
+    log::info!(
+        "stream proxy media request: method={} range={}",
+        request.method(),
+        range.as_deref().unwrap_or("none")
+    );
 
     let source = match find_source(app, &source_id) {
         Ok(source) => source,
@@ -247,13 +259,26 @@ fn serve_stream(
     let requested_start = range.and_then(parse_range_start).unwrap_or(0);
     cache.ensure_stream(app, source, remote_path, &entry, requested_start, None);
 
+    let wait_started = std::time::Instant::now();
     let total = match cache.wait_total(&entry, crate::streaming::stream_cache::TOTAL_WAIT) {
-        TotalState::Known(total) => total,
+        TotalState::Known(total) => {
+            log::info!(
+                "stream cache headers ready: total={} wait_ms={}",
+                total,
+                wait_started.elapsed().as_millis()
+            );
+            total
+        }
         TotalState::Failed(status, message) => {
+            log::error!("stream cache upstream failed before headers: status={status}");
             let _ = request.respond(text(status, &message));
             return;
         }
         TotalState::Unknown => {
+            log::warn!(
+                "stream cache headers timed out after {}ms; using direct proxy",
+                wait_started.elapsed().as_millis()
+            );
             // No usable upstream headers (or no range support reported yet):
             // fall back to the direct streaming proxy so playback still works.
             serve_webdav(request, app, client, source, remote_path, range);
@@ -275,8 +300,8 @@ fn serve_stream(
     // Ensure the downloader covers the requested offset (handles seeks).
     cache.ensure_stream(app, source, remote_path, &entry, start, None);
 
-    let content_type = content_type_for(remote_path)
-        .unwrap_or_else(|| "application/octet-stream".to_string());
+    let content_type =
+        content_type_for(remote_path).unwrap_or_else(|| "application/octet-stream".to_string());
     let mut headers = vec![Header::from_bytes("Accept-Ranges", "bytes").unwrap()];
     headers.extend(cors_headers());
     if let Ok(header) = Header::from_bytes("Content-Type", content_type.as_bytes()) {
@@ -294,13 +319,18 @@ fn serve_stream(
     let length = end.saturating_sub(start) + 1;
     let reader = cache.reader(&entry, start, end);
     let status = if ranged { 206 } else { 200 };
-    let _ = request.respond(Response::new(
+    let response = Response::new(
         StatusCode(status),
         headers,
         reader,
         Some(length as usize),
         None,
-    ));
+    );
+    if let Err(error) = request.respond(response) {
+        log::error!("stream cache response failed: status={status} error={error}");
+    } else {
+        log::info!("stream cache response completed: status={status} range={start}-{end}/{total}");
+    }
 }
 
 /// Serve a fully cached (smart) file with `Range` support.
@@ -411,8 +441,8 @@ fn serve_local(request: Request, root: &Path, remote_path: &str, range: Option<&
             return;
         }
     };
-    let content_type = content_type_for(remote_path)
-        .unwrap_or_else(|| "application/octet-stream".to_string());
+    let content_type =
+        content_type_for(remote_path).unwrap_or_else(|| "application/octet-stream".to_string());
 
     let mut headers = vec![Header::from_bytes("Accept-Ranges", "bytes").unwrap()];
     headers.extend(cors_headers());
@@ -523,12 +553,26 @@ fn serve_webdav(
     let upstream = match upstream_request.send() {
         Ok(response) => response,
         Err(error) => {
+            log::error!(
+                "direct WebDAV request failed: timeout={} connect={} request={} body={}",
+                error.is_timeout(),
+                error.is_connect(),
+                error.is_request(),
+                error.is_body()
+            );
             let _ = request.respond(text(502, &error.to_string()));
             return;
         }
     };
 
     let status = upstream.status();
+    log::info!(
+        "direct WebDAV response headers: status={} content_length={:?} content_type={:?} content_range={:?}",
+        status.as_u16(),
+        upstream.content_length(),
+        upstream.headers().get(reqwest::header::CONTENT_TYPE).and_then(|value| value.to_str().ok()),
+        upstream.headers().get(reqwest::header::CONTENT_RANGE).and_then(|value| value.to_str().ok())
+    );
     if !(status.is_success() || status == reqwest::StatusCode::PARTIAL_CONTENT) {
         let message = upstream.text().unwrap_or_default();
         let _ = request.respond(text(status.as_u16(), &message));
@@ -542,7 +586,10 @@ fn serve_webdav(
         let name = name.as_str();
         if name == "content-type" {
             let val_str = value.to_str().unwrap_or_default();
-            if val_str.contains("octet-stream") || val_str.contains("text/plain") || val_str.is_empty() {
+            if val_str.contains("octet-stream")
+                || val_str.contains("text/plain")
+                || val_str.is_empty()
+            {
                 if let Some(ct) = content_type_for(remote_path) {
                     if let Ok(header) = Header::from_bytes("Content-Type", ct.as_bytes()) {
                         headers.push(header);
@@ -570,13 +617,18 @@ fn serve_webdav(
     }
 
     let length = upstream.content_length().map(|value| value as usize);
-    let _ = request.respond(Response::new(
+    if let Err(error) = request.respond(Response::new(
         StatusCode(status.as_u16()),
         headers,
         upstream,
         length,
         None,
-    ));
+    )) {
+        log::error!(
+            "direct WebDAV response body failed: status={} error={error}",
+            status.as_u16()
+        );
+    }
 }
 
 pub(crate) fn build_url(base: &str, remote_path: &str) -> Result<reqwest::Url, String> {
@@ -671,6 +723,10 @@ fn cors_headers() -> Vec<Header> {
         ("Access-Control-Allow-Origin", "*"),
         ("Access-Control-Allow-Methods", "GET, OPTIONS"),
         ("Access-Control-Allow-Headers", "Range, Content-Type"),
+        (
+            "Access-Control-Expose-Headers",
+            "Content-Range, Content-Length, Accept-Ranges",
+        ),
         ("Access-Control-Max-Age", "86400"),
     ]
     .iter()
@@ -768,7 +824,9 @@ pub struct CacheUsage {
 /// Separate usage figures for the read-ahead buffer, the automatic whole-track
 /// cache, and the manual (pinned) cache, in bytes.
 #[tauri::command]
-pub fn cache_usage(proxy: tauri::State<StreamProxy>) -> Result<CacheUsage, crate::core::error::AppError> {
+pub fn cache_usage(
+    proxy: tauri::State<StreamProxy>,
+) -> Result<CacheUsage, crate::core::error::AppError> {
     Ok(CacheUsage {
         stream_bytes: proxy.cache.used_bytes(),
         stream_limit_bytes: proxy.cache.limit_bytes(),
@@ -851,7 +909,9 @@ pub fn set_smart_cache_limit(
     limit_mb: u64,
 ) -> Result<u64, crate::core::error::AppError> {
     write_smart_limit_mb(&app, limit_mb).map_err(crate::core::error::AppError::Store)?;
-    proxy.smart.set_limit_bytes(limit_mb.saturating_mul(1024 * 1024));
+    proxy
+        .smart
+        .set_limit_bytes(limit_mb.saturating_mul(1024 * 1024));
     Ok(limit_mb)
 }
 

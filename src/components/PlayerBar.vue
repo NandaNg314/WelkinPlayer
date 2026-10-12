@@ -30,6 +30,20 @@ const player = usePlayerStore();
 const desktopLyrics = useDesktopLyricsStore();
 /** Mobile control tray; desktop always renders the full set of controls. */
 const expanded = ref(false);
+const isScrubbing = ref(false);
+const pointerScrub = ref(false);
+const seekPreview = ref(0);
+
+const displayProgress = computed(() => isScrubbing.value ? seekPreview.value : player.progress);
+const displayElapsed = computed(() => isScrubbing.value ? formatClock(player.duration * seekPreview.value / 100) : player.elapsedTime);
+
+function formatClock(seconds: number): string {
+  const total = Number.isFinite(seconds) && seconds > 0 ? Math.floor(seconds) : 0;
+  const hours = Math.floor(total / 3600);
+  const minutes = Math.floor((total % 3600) / 60);
+  const rest = String(total % 60).padStart(2, "0");
+  return hours > 0 ? `${hours}:${String(minutes).padStart(2, "0")}:${rest}` : `${minutes}:${rest}`;
+}
 
 const repeatTitle = computed(() => player.repeat === "one" ? t("controls.repeatOne") : player.repeat === "all" ? t("controls.repeatAll") : t("controls.repeatOff"));
 const shuffleTitle = computed(() => player.shuffle ? t("controls.shuffleOn") : t("controls.shuffleOff"));
@@ -45,24 +59,67 @@ function toggleDesktopLyrics() {
   desktopLyrics.update({ enabled: !desktopLyrics.settings.enabled });
 }
 
-function onSeek(event: Event) {
-  seekPercent(Number((event.target as HTMLInputElement).value));
+function beginPointerScrub(event: PointerEvent) {
+  pointerScrub.value = true;
+  isScrubbing.value = true;
+  seekPreview.value = player.progress;
+  (event.currentTarget as HTMLInputElement).setPointerCapture(event.pointerId);
+}
+
+function previewSeek(event: Event) {
+  seekPreview.value = Number((event.target as HTMLInputElement).value);
+  isScrubbing.value = true;
+}
+
+function commitSeek() {
+  if (pointerScrub.value || !isScrubbing.value) return;
+  seekPercent(seekPreview.value);
+  isScrubbing.value = false;
+}
+
+function finishPointerScrub() {
+  if (!pointerScrub.value) return;
+  seekPercent(seekPreview.value);
+  pointerScrub.value = false;
+  isScrubbing.value = false;
+}
+
+function cancelPointerScrub() {
+  if (!pointerScrub.value) return;
+  pointerScrub.value = false;
+  isScrubbing.value = false;
+  seekPreview.value = player.progress;
 }
 </script>
 
 <template>
-  <footer class="relative border-t border-line/70 bg-surface/90 backdrop-blur-xl">
-    <input
-      :value="player.progress"
-      :style="{ '--fill': percent(player.progress), '--buffered': percent(player.bufferedProgress) }"
-      class="ak-slider absolute inset-x-0 -top-[2px] z-10"
-      type="range"
-      min="0"
-      max="100"
-      aria-label="Playback position"
-      @input="onSeek"
-    />
-    <div class="flex h-[72px] items-center gap-4 px-4">
+  <footer class="relative border-t border-line/70 bg-surface/95 shadow-[0_-10px_36px_rgba(0,0,0,0.08)] backdrop-blur-xl">
+    <div class="px-4 pt-2">
+      <div class="mb-0.5 flex items-center justify-between px-0.5 font-mono text-[10px] tabular-nums text-muted" aria-hidden="true">
+        <span>{{ displayElapsed }}</span>
+        <span>{{ player.totalTime }}</span>
+      </div>
+      <input
+        :value="displayProgress"
+        :style="{ '--fill': percent(displayProgress), '--buffered': percent(player.bufferedProgress) }"
+        class="ak-slider seek-slider"
+        :class="isScrubbing ? 'seek-slider-active' : ''"
+        type="range"
+        min="0"
+        max="100"
+        step="0.1"
+        :disabled="player.duration <= 0"
+        aria-label="Playback position"
+        :aria-valuetext="`${displayElapsed} / ${player.totalTime}`"
+        @pointerdown="beginPointerScrub"
+        @input="previewSeek"
+        @change="commitSeek"
+        @pointerup="finishPointerScrub"
+        @pointercancel="cancelPointerScrub"
+        @blur="commitSeek"
+      />
+    </div>
+    <div class="flex h-[68px] items-center gap-4 px-4">
       <div class="grid min-w-0 flex-1 grid-cols-[48px_minmax(0,1fr)] items-center gap-x-3.5 gap-y-0.5 md:w-[230px] md:flex-none">
         <button
           type="button"
@@ -113,7 +170,7 @@ function onSeek(event: Event) {
       </div>
 
       <div class="ml-auto flex items-center gap-2.5">
-        <span class="hidden font-mono text-[13px] tabular-nums text-muted lg:block">
+        <span class="hidden font-mono text-[13px] tabular-nums text-muted xl:block">
           {{ player.elapsedTime }} / {{ player.totalTime }}
         </span>
         <button
