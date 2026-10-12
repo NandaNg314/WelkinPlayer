@@ -39,3 +39,6 @@ src-tauri/alac-wasm/target/
 # Local audio fixtures for the wasm integration tests (generated via ffmpeg;
 # not part of the repo). `tests/*.mjs` ARE committed.
 test-alac/
+
+# Local-only working notes (implementation summary of the ALAC work).
+ALAC-IMPLEMENTATION.md
