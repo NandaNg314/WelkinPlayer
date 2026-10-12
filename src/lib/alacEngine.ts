@@ -32,6 +32,8 @@ const FETCH_CHUNK = 256 * 1024;
 const POLL_CAP = 65536;
 /** Timeupdate cadence (matches HTMLMediaElement's ~4 Hz). */
 const TIMEUPDATE_MS = 250;
+/** Consecutive fetch failures before surfacing a hard error in the pump. */
+const MAX_FETCH_RETRIES = 20;
 
 function isAlacCandidate(path: string): boolean {
   const ext = path.split(".").pop()?.toLowerCase() ?? "";
@@ -74,6 +76,8 @@ export class AlacEngine {
   private _muted = false;
   private _paused = true;
   private _endedFlag = false;
+  /** True while an ALAC seek is rebuilding its buffer. */
+  private _seeking = false;
   private metadataReady = false;
 
   private listeners = new Map<string, Set<EventListenerOrEventListenerObject>>();
@@ -99,7 +103,7 @@ export class AlacEngine {
     return this.native?.ended ?? this._endedFlag;
   }
   get seeking(): boolean {
-    return this.native?.seeking ?? false;
+    return this.native?.seeking ?? this._seeking;
   }
   get duration(): number {
     if (this.native) {
@@ -150,7 +154,12 @@ export class AlacEngine {
   get readyState(): number {
     if (this.native) return this.native.readyState;
     if (!this.metadataReady) return HTMLMediaElement.HAVE_NOTHING;
-    if (this.ringHead !== this.ringTail) return HTMLMediaElement.HAVE_FUTURE_DATA;
+    // Judge buffering by buffered TIME, not by "is the ring non-empty": the
+    // audio thread drains the ring in 4096-frame steps and the pump refills it
+    // in bursts, so a non-empty test flickers and the stall watchdog in
+    // audio.ts would repeatedly "recover" (reload) a perfectly healthy track.
+    if (this.bufferedSeconds() >= 0.25) return HTMLMediaElement.HAVE_FUTURE_DATA;
+    if (this.bufferedSeconds() > 0) return HTMLMediaElement.HAVE_CURRENT_DATA;
     return HTMLMediaElement.HAVE_METADATA;
   }
 
@@ -228,7 +237,13 @@ export class AlacEngine {
    */
   private resumeContext(): void {
     if (this.ctx && this.ctx.state !== "running") {
-      void this.ctx.resume();
+      // A rejected resume means the call happened outside a user gesture
+      // (Android WebView enforces the autoplay policy; the desktop-only
+      // `additionalBrowserArgs` flags do not apply there). The next real tap
+      // routes through play() -> resumeContext() again, so just report it.
+      this.ctx.resume().catch((error) => {
+        console.warn("[alac] AudioContext resume deferred (needs a user gesture)", error);
+      });
     }
   }
 
@@ -325,8 +340,11 @@ export class AlacEngine {
     this.seekBase = 0;
     this.decodedFrames = 0;
 
-    this.pump(generation);
+    // Set `pumpRunning` BEFORE the async pump starts its first await; a
+    // `seekTo` arriving mid-startup would otherwise see it false and launch a
+    // stray second pump sharing the same decoder.
     this.pumpRunning = true;
+    this.pump(generation);
   }
 
   private stop(): void {
@@ -386,13 +404,20 @@ export class AlacEngine {
 
   /** Download + decode loop; runs until the ring is full, the track ends,
    *  the source changes, or a non-ALAC container forces a native fallback. */
+  /** Consecutive fetch failures in the pump loop; drives a hard error. */
+  private fetchFailures = 0;
+
   private async pump(generation: number): Promise<void> {
     const pcm = new Int32Array(POLL_CAP);
 
     while (generation === this.generation && !this.closed) {
+      // Respect the play/pause state: when paused we stop making progress on
+      // the playhead but keep the decoder warm (the ring stays refillable so
+      // resume is instant). We still poll to keep the buffer filled.
       const result = this.decoder.pollOnce(pcm);
 
       if (result > 0) {
+        this.fetchFailures = 0;
         if (!this.metadataReady) {
           this.metadataReady = true;
           const info = this.decoder.metadata;
@@ -406,10 +431,20 @@ export class AlacEngine {
           this.dispatch("durationchange");
         }
         this.pushPcm(pcm, result);
-        this.decodedFrames += result;
-        this._currentTime = this.seekBase + this.decodedFrames / this.sampleRate;
-        this.maybeTimeupdate();
+        // Only advance the playhead while actually playing.
+        if (!this._paused) {
+          this.decodedFrames += result;
+          this._currentTime = this.seekBase + this.decodedFrames / this.sampleRate;
+          this.maybeTimeupdate();
+        }
       } else if (result === AlacPoll.NeedMoreBytes) {
+        // Pull the region the demuxer wants. If a lot of audio is already
+        // buffered (decoded but not yet played), throttle the download so a
+        // phone does not grab the whole file in one burst.
+        if (this.bufferedSeconds() > RING_SECONDS * 2) {
+          await sleep(150);
+          continue;
+        }
         const need = this.decoder.needOffset();
         const start = Math.min(Math.max(need, 0), this.totalBytes);
         const ok = await this.fetchAndFeed(start, FETCH_CHUNK);
@@ -418,6 +453,16 @@ export class AlacEngine {
             this._endedFlag = true;
             this.pumpRunning = false;
             this.dispatch("ended");
+            return;
+          }
+          // A persistent failure (bad token after a proxy restart, a Range the
+          // proxy rejects, network drop) must not retry forever: after a
+          // budget, surface a real error instead of spinning silently.
+          this.fetchFailures += 1;
+          if (this.fetchFailures >= MAX_FETCH_RETRIES) {
+            this.decodeFailed = true;
+            this.pumpRunning = false;
+            this.dispatch("error");
             return;
           }
           await sleep(250);
@@ -434,6 +479,15 @@ export class AlacEngine {
         this.fallbackToNative();
         return;
       } else {
+        // Fatal decode/probe error. If we never even got metadata, the file
+        // may simply be an m4a whose ALAC probe failed (a non-ALAC container
+        // we could not classify) — give the native element a chance instead
+        // of declaring the track unplayable.
+        if (!this.metadataReady && this.streamUrl) {
+          this.pumpRunning = false;
+          this.fallbackToNative();
+          return;
+        }
         this.decodeFailed = true;
         this.pumpRunning = false;
         this.dispatch("error");
@@ -483,10 +537,27 @@ export class AlacEngine {
     return this.availableWrite() < this.sampleRate / 2;
   }
 
+  /** Seconds of PCM currently queued in the ring (decoded but unplayed). */
+  private bufferedSeconds(): number {
+    if (this.samplesPerChannel === 0) return 0;
+    let queued = this.ringHead - this.ringTail;
+    if (queued < 0) queued += this.samplesPerChannel;
+    return queued / this.sampleRate;
+  }
+
   private onAudioProcess(event: AudioProcessingEvent): void {
     const outL = event.outputBuffer.getChannelData(0);
     const outR = event.outputBuffer.getChannelData(1);
     const n = Math.min(outL.length, outR.length);
+    // A paused engine must be silent. ScriptProcessorNode keeps firing while
+    // connected, so gating here (rather than suspending the context) is what
+    // actually stops the sound; the ring is deliberately NOT drained so a
+    // resume continues from the same sample.
+    if (this._paused) {
+      outL.fill(0);
+      outR.fill(0);
+      return;
+    }
     for (let index = 0; index < n; index += 1) {
       if (this.ringHead === this.ringTail) {
         outL[index] = 0;
@@ -520,10 +591,16 @@ export class AlacEngine {
     this._currentTime = clamped;
     this.decoder.seek(clamped);
     this._endedFlag = false;
+    // Mark seeking so audio.ts's stall watchdog does not mistake the refill
+    // window for a stall and force a reload mid-seek.
+    this._seeking = true;
+    window.setTimeout(() => {
+      this._seeking = false;
+    }, 500);
     if (!this.pumpRunning && !this.closed && this._src) {
       const generation = ++this.generation;
-      this.pump(generation);
       this.pumpRunning = true;
+      this.pump(generation);
     }
   }
 }

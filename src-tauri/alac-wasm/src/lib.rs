@@ -17,6 +17,7 @@
 //! hand each packet to symphonia's raw `Decoder`. This is push-based: zero
 //! lost packets, true progressive playback, and exact sample seeking.
 
+use std::alloc::Layout;
 use std::io::{Read, Seek, SeekFrom};
 use std::sync::{Arc, Mutex};
 
@@ -650,21 +651,33 @@ enum PollOutcome {
 
 // ---- C ABI exposed to the frontend ----------------------------------------
 
+/// Alignment used for every JS-facing allocation. JS builds `Int32Array`
+/// and `Float32Array` views over these pointers, which REQUIRE the offset to
+/// be a multiple of 4; `Vec<u8>` only guarantees byte alignment, so a
+/// misaligned pointer would throw a RangeError when the view is constructed.
+const JS_ALLOC_ALIGN: usize = 8;
+
+fn js_layout(len: usize) -> Layout {
+    // `from_size_align` can fail on overflow; fall back to a 1-byte request
+    // that cannot overflow (the caller treats a 0 pointer as failure anyway).
+    Layout::from_size_align(len.max(1), JS_ALLOC_ALIGN).unwrap_or(Layout::new::<u8>())
+}
+
 #[no_mangle]
 pub extern "C" fn alac_alloc(len: usize) -> *mut u8 {
-    let mut buf = Vec::<u8>::with_capacity(len);
-    let ptr = buf.as_mut_ptr();
-    std::mem::forget(buf);
-    ptr
+    if len == 0 {
+        return std::ptr::null_mut();
+    }
+    unsafe { std::alloc::alloc(js_layout(len)) }
 }
 
 #[no_mangle]
 pub extern "C" fn alac_free(ptr: *mut u8, len: usize) {
-    if ptr.is_null() {
+    if ptr.is_null() || len == 0 {
         return;
     }
     unsafe {
-        drop(Vec::from_raw_parts(ptr, 0, len));
+        std::alloc::dealloc(ptr, js_layout(len));
     }
 }
 
