@@ -53,8 +53,12 @@ export class AlacDecoder {
     const response = await fetch(wasmUrl);
     if (!response.ok) throw new Error(`alac: failed to load ${wasmUrl} (${response.status})`);
     const bytes = await response.arrayBuffer();
-    const memory = new WebAssembly.Memory({ initial: 16, maximum: 512 });
-    const { instance } = await WebAssembly.instantiate(bytes, { env: { memory } });
+    // The module does NOT import a memory; it exports its own. Passing an
+    // `env.memory` would be silently ignored and every JS-side view would be
+    // built against an unrelated buffer, so all fed bytes would go nowhere.
+    const { instance } = await WebAssembly.instantiate(bytes, {});
+    const memory = (instance.exports as { memory?: WebAssembly.Memory }).memory;
+    if (!memory) throw new Error("alac: module did not export memory");
     this.instance = instance;
     this.memory = memory;
   }

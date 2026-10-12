@@ -205,6 +205,9 @@ fn serve_cover(request: Request, app: &AppHandle, hash: &str) {
     if let Ok(header) = Header::from_bytes("Content-Type", "image/jpeg") {
         response.add_header(header);
     }
+    for header in cors_headers() {
+        response.add_header(header);
+    }
     let _ = request.respond(response);
 }
 
@@ -275,6 +278,7 @@ fn serve_stream(
     let content_type = content_type_for(remote_path)
         .unwrap_or_else(|| "application/octet-stream".to_string());
     let mut headers = vec![Header::from_bytes("Accept-Ranges", "bytes").unwrap()];
+    headers.extend(cors_headers());
     if let Ok(header) = Header::from_bytes("Content-Type", content_type.as_bytes()) {
         headers.push(header);
     }
@@ -318,6 +322,7 @@ fn serve_cached_file(request: Request, file_path: &Path, remote_path: &str, rang
     let content_type =
         content_type_for(remote_path).unwrap_or_else(|| "application/octet-stream".to_string());
     let mut headers = vec![Header::from_bytes("Accept-Ranges", "bytes").unwrap()];
+    headers.extend(cors_headers());
     if let Ok(header) = Header::from_bytes("Content-Type", content_type.as_bytes()) {
         headers.push(header);
     }
@@ -410,6 +415,7 @@ fn serve_local(request: Request, root: &Path, remote_path: &str, range: Option<&
         .unwrap_or_else(|| "application/octet-stream".to_string());
 
     let mut headers = vec![Header::from_bytes("Accept-Ranges", "bytes").unwrap()];
+    headers.extend(cors_headers());
     if let Ok(header) = Header::from_bytes("Content-Type", content_type.as_bytes()) {
         headers.push(header);
     }
@@ -530,6 +536,7 @@ fn serve_webdav(
     }
 
     let mut headers = vec![Header::from_bytes("Accept-Ranges", "bytes").unwrap()];
+    headers.extend(cors_headers());
     let mut has_content_type = false;
     for (name, value) in upstream.headers() {
         let name = name.as_str();
@@ -620,7 +627,17 @@ fn generate_token() -> String {
 fn empty(status: u16) -> Response<Cursor<Vec<u8>>> {
     Response::new(
         StatusCode(status),
-        vec![Header::from_bytes("Allow", "GET, OPTIONS").unwrap()],
+        vec![
+            Header::from_bytes("Allow", "GET, OPTIONS").unwrap(),
+            // The frontend fetches the stream with the browser `fetch` API
+            // (Range requests, for the wasm ALAC path), which is a CORS
+            // request from the webview's origin to this loopback proxy.
+            // Without ACAO the WebView blocks every byte it needs.
+            Header::from_bytes("Access-Control-Allow-Origin", "*").unwrap(),
+            Header::from_bytes("Access-Control-Allow-Methods", "GET, OPTIONS").unwrap(),
+            Header::from_bytes("Access-Control-Allow-Headers", "Range, Content-Type").unwrap(),
+            Header::from_bytes("Access-Control-Max-Age", "86400").unwrap(),
+        ],
         Cursor::new(Vec::new()),
         Some(0),
         None,
@@ -630,11 +647,35 @@ fn empty(status: u16) -> Response<Cursor<Vec<u8>>> {
 fn text(status: u16, message: &str) -> Response<Cursor<Vec<u8>>> {
     Response::new(
         StatusCode(status),
-        vec![Header::from_bytes("Content-Type", "text/plain; charset=utf-8").unwrap()],
+        vec![
+            Header::from_bytes("Content-Type", "text/plain; charset=utf-8").unwrap(),
+            Header::from_bytes("Access-Control-Allow-Origin", "*").unwrap(),
+            Header::from_bytes("Access-Control-Allow-Methods", "GET, OPTIONS").unwrap(),
+            Header::from_bytes("Access-Control-Allow-Headers", "Range, Content-Type").unwrap(),
+            Header::from_bytes("Access-Control-Max-Age", "86400").unwrap(),
+        ],
         Cursor::new(message.as_bytes().to_vec()),
         Some(message.len()),
         None,
     )
+}
+
+/// CORS headers for the streaming responses. The frontend ALAC engine fetches
+/// the stream with `fetch()` (which sends a preflight OPTIONS first), so every
+/// response on this loopback proxy must allow the cross-origin read — without
+/// it, Android's WebView silently blocks the Range requests and ALAC never
+/// gets its bytes. The proxy is token-gated and bound to 127.0.0.1, so a
+/// wildcard origin is safe here.
+fn cors_headers() -> Vec<Header> {
+    [
+        ("Access-Control-Allow-Origin", "*"),
+        ("Access-Control-Allow-Methods", "GET, OPTIONS"),
+        ("Access-Control-Allow-Headers", "Range, Content-Type"),
+        ("Access-Control-Max-Age", "86400"),
+    ]
+    .iter()
+    .filter_map(|(name, value)| Header::from_bytes(*name, value.as_bytes()).ok())
+    .collect()
 }
 
 /// Aggressively prefetch a track's bytes into the read-ahead cache. Called for

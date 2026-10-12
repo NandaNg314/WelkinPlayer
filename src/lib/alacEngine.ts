@@ -212,11 +212,24 @@ export class AlacEngine {
     if (this.native) return this.native.play();
     this._paused = false;
     this._endedFlag = false;
-    if (this.ctx && this.ctx.state === "suspended") {
-      void this.ctx.resume();
-    }
+    this.resumeContext();
     this.dispatch("play");
     return Promise.resolve();
+  }
+
+  /**
+   * Resume the AudioContext if it exists.
+   *
+   * Android's WebView (like every Chromium) starts an AudioContext
+   * `suspended` and only allows it to run after a user gesture. `play()` can
+   * be called before `start()` has finished its async setup, so the resume
+   * must ALSO run right after the context is created — otherwise it stays
+   * suspended forever and `onaudioprocess` never fires (silent playback).
+   */
+  private resumeContext(): void {
+    if (this.ctx && this.ctx.state !== "running") {
+      void this.ctx.resume();
+    }
   }
 
   pause(): void {
@@ -258,6 +271,18 @@ export class AlacEngine {
     this.closed = false;
     const generation = ++this.generation;
 
+    // A new src invalidates any previous native fallback element: if a
+    // previous track was AAC (played via the internal <audio>), that element
+    // still targets the OLD url. The re-probe below may fall back again for
+    // this track, and it must then create a fresh native bound to the NEW
+    // url — otherwise switching tracks keeps replaying the previous song.
+    if (this.native) {
+      this.native.pause();
+      this.native.removeAttribute("src");
+      this.native.load();
+      this.native = null;
+    }
+
     try {
       await this.decoder.load("alac.wasm");
     } catch (error) {
@@ -280,10 +305,16 @@ export class AlacEngine {
       this.gain = this.ctx.createGain();
       this.gain.gain.value = this._muted ? 0 : this._volume;
       this.gain.connect(this.ctx.destination);
-      this.processor = this.ctx.createScriptProcessor(4096, 0, this.channels);
+      // Fixed 2-channel output: ALAC sources may be mono, but the ring is
+      // always converted to stereo (`pushPcm` duplicates channel 0), so the
+      // processor must be created for 2 channels regardless of the source.
+      this.processor = this.ctx.createScriptProcessor(4096, 0, 2);
       this.processor.onaudioprocess = (event) => this.onAudioProcess(event);
       this.processor.connect(this.gain);
     }
+    // The context is created asynchronously, possibly after `play()` already
+    // asked to start; make sure it is actually running now.
+    this.resumeContext();
 
     this.decoder.open(this.totalBytes);
     this.metadataReady = false;
